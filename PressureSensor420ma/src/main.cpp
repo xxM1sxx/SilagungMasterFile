@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #define CurrentSensorPin  13
 #define VREF 3300 // ADC's reference voltage on ESP32-S3: 3300mV
-#define SAMPLES 20   // Increased samples for better averaging
+#define SAMPLES 10   // Increased samples for better averaging
 #define FILTER_ALPHA 0.1  // Low-pass filter coefficient (0.1 = heavy filtering)
 
 // Pressure sensor specifications: 0-10 Bar, 4-20mA
