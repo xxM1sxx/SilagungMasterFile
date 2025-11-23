@@ -199,6 +199,57 @@ void writePressureToHMI() {
     hmiNode.writeSingleRegister(0x0002, p); // LW2 - Pressure
 }
 
+bool writeCoilWithRetry(uint16_t coil, bool state) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    uint8_t r = relayNode.writeSingleCoil(coil, state ? 1 : 0);
+    if (r == relayNode.ku8MBSuccess) return true;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (attempt == 1) {
+      LOG_ERROR("Relay write failure coil:%u state:%u code:%u", coil, state?1:0, r);
+    }
+  }
+  return false;
+}
+
+bool controlRelayValve(int idx, bool open) {
+  int openCoil = idx * 2;
+  int closeCoil = openCoil + 1;
+  bool s1 = writeCoilWithRetry(openCoil, false);
+  bool s2 = writeCoilWithRetry(closeCoil, false);
+  vTaskDelay(pdMS_TO_TICKS(100));
+  bool ok = false;
+  if (open) {
+    bool a = writeCoilWithRetry(closeCoil, false);
+    bool b = writeCoilWithRetry(openCoil, true);
+    ok = a && b;
+  } else {
+    bool a = writeCoilWithRetry(openCoil, false);
+    bool b = writeCoilWithRetry(closeCoil, true);
+    ok = a && b;
+  }
+  uint8_t res = relayNode.readCoils(openCoil, 2);
+  if (res == relayNode.ku8MBSuccess) {
+    uint16_t word = relayNode.getResponseBuffer(0);
+    bool o = word & 0x01;
+    bool c = word & 0x02;
+    if (o && c) {
+      writeCoilWithRetry(openCoil, false);
+      writeCoilWithRetry(closeCoil, false);
+      LOG_ERROR("Relay conflict valve:%d", idx+1);
+      return false;
+    }
+    if (open && (!o || c)) {
+      LOG_WARN("Relay verify open mismatch valve:%d", idx+1);
+    }
+    if (!open && (!c || o)) {
+      LOG_WARN("Relay verify close mismatch valve:%d", idx+1);
+    }
+  } else {
+    LOG_WARN("Relay read failure valve:%d code:%u", idx+1, res);
+  }
+  return ok;
+}
+
 // Function to read EC sensor with error handling
 bool readECSensor(ModbusMaster& node, float& ecValue, const char* sensorName) {
     uint8_t result = node.readHoldingRegisters(0x0002, 1);
@@ -448,40 +499,21 @@ void TaskModbus(void* pv) {
           valveState[i] = btn;
           xSemaphoreGive(xStateMutex);
 
-          // Check if this is a web-initiated change
           if (webButtonChange[i]) {
-            // This change came from web - execute relay and update lamp
-            int openCoil = i * 2;
-            int closeCoil = openCoil + 1;
-            relayNode.writeSingleCoil(closeCoil, 0);
-            vTaskDelay(pdMS_TO_TICKS(1));
-            relayNode.writeSingleCoil(openCoil, btn ? 1 : 0);
-
-            // Update HMI lamp
+            bool success = controlRelayValve(i, btn);
             hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
-            
-            LOG_INFO("WEB-initiated control - Button %d changed to %s - Relay executed", i+1, btn?"ON":"OFF");
-            
-            // Clear the web change flag
+            if (!success) {
+              LOG_ERROR("WEB control relay failure valve:%d", i+1);
+            }
             webButtonChange[i] = false;
-            
-            // Publish status update to web immediately
             publishValveStatus();
             LOG_INFO("WEB control completed for valve %d", i+1);
           } else {
-            // This change came from physical HMI - execute normally
-            int openCoil = i * 2;
-            int closeCoil = openCoil + 1;
-            relayNode.writeSingleCoil(closeCoil, 0);
-            vTaskDelay(pdMS_TO_TICKS(1));
-            relayNode.writeSingleCoil(openCoil, btn ? 1 : 0);
-
-            // Update HMI lamp
+            bool success = controlRelayValve(i, btn);
             hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
-            
-            LOG_INFO("HMI control - Button %d changed to %s - Syncing to web", i+1, btn?"ON":"OFF");
-            
-            // Publish status update to web immediately after HMI change
+            if (!success) {
+              LOG_ERROR("HMI control relay failure valve:%d", i+1);
+            }
             publishValveStatus();
             LOG_INFO("HMI change synced to web for valve %d", i+1);
           }
