@@ -40,9 +40,6 @@ const char* topic_irrigation_ack = "silagung/irrigation/ack";
 #define LOG_LEVEL_WARN 2
 #define LOG_LEVEL_ERROR 3
 #define LOG_LEVEL LOG_LEVEL_INFO
-// Optimasi timing (harus didefinisikan sebelum digunakan)
-#define COIL_ACTION_DELAY_MS 80
-#define HMI_SCAN_INTERVAL_MS 80
 
 // Logging Macros
 #if LOG_ENABLED
@@ -92,39 +89,23 @@ float registersToFloat(uint16_t r1, uint16_t r2) {
 }
 
 float regsToFloatHL(uint16_t high, uint16_t low) {
-  // Perbaikan: konversi urutan High-Low (high di 16-bit atas, low di 16-bit bawah)
   uint32_t raw = ((uint32_t)high << 16) | low;
   float val;
   memcpy(&val, &raw, sizeof(val));
   return val;
 }
 float regsToFloatLH(uint16_t low, uint16_t high) {
-  // Perbaikan: konversi urutan Low-High (low di 16-bit atas, high di 16-bit bawah)
-  // Sebelumnya salah karena menggunakan urutan High-Low sehingga pembacaan float Modbus bisa keliru
-  uint32_t raw = ((uint32_t)low << 16) | high;
+  uint32_t raw = ((uint32_t)high << 16) | low;
   float val;
   memcpy(&val, &raw, sizeof(val));
   return val;
 }
 
-// Deklarasi awal helper mutex agar bisa dipakai sebelum definisi
-static inline bool takeRS485(TickType_t timeout);
-static inline void releaseRS485();
-
 bool readFloat32Holding(ModbusMaster& node, uint16_t addr, float &out) {
-  // Lindungi akses RS485 untuk mencegah benturan antar task
-  if (!takeRS485(pdMS_TO_TICKS(100))) {
-    LOG_WARN("RS485 busy while reading holding regs addr:%u", addr);
-    return false;
-  }
   uint8_t res = node.readHoldingRegisters(addr, 2);
-  uint16_t w0 = 0, w1 = 0;
-  if (res == node.ku8MBSuccess) {
-    w0 = node.getResponseBuffer(0);
-    w1 = node.getResponseBuffer(1);
-  }
-  releaseRS485();
   if (res != node.ku8MBSuccess) return false;
+  uint16_t w0 = node.getResponseBuffer(0);
+  uint16_t w1 = node.getResponseBuffer(1);
   float a = regsToFloatHL(w0, w1);
   if (isfinite(a)) { out = a; return true; }
   float b = regsToFloatLH(w0, w1);
@@ -137,8 +118,6 @@ QueueHandle_t xSensorQueue;
 QueueHandle_t xCmdQueue;
 QueueHandle_t xIrrigationQueue;
 SemaphoreHandle_t xStateMutex;
-// Mutex untuk melindungi akses RS485/Modbus lintas task agar tidak terjadi collision
-SemaphoreHandle_t xRS485Mutex;
 TaskHandle_t xMQTTTask, xModbusTask, xMQTTRecvTask;
 TaskHandle_t xSchedulerTask;
 struct ControlCmd {
@@ -176,27 +155,6 @@ ModbusMaster hmiNode, relayNode, flowNode, ecNode, us1Node, us2Node;
 WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
-// Helper untuk mengambil/melepas mutex RS485
-static inline bool takeRS485(TickType_t timeout) {
-  return (xRS485Mutex != NULL) && (xSemaphoreTake(xRS485Mutex, timeout) == pdTRUE);
-}
-static inline void releaseRS485() {
-  if (xRS485Mutex != NULL) {
-    xSemaphoreGive(xRS485Mutex);
-  }
-}
-
-// Self-test sederhana untuk memastikan konversi float Modbus berfungsi
-static void selfTestFloatConversions() {
-  union { float f; uint32_t u; } conv;
-  conv.f = 12.34f;
-  uint16_t hi = (uint16_t)((conv.u >> 16) & 0xFFFF);
-  uint16_t lo = (uint16_t)(conv.u & 0xFFFF);
-  float fHL = regsToFloatHL(hi, lo);
-  float fLH = regsToFloatLH(lo, hi);
-  LOG_INFO("Float conversion self-test: orig=%.4f HL=%.4f LH=%.4f", conv.f, fHL, fLH);
-}
-
 // ====== RTC, NTP, and Preferences for Scheduling ======
 RTC_DS3231 rtc;
 static const int SDA_PIN = 8;
@@ -214,6 +172,17 @@ const unsigned int NO_FLOW_STALL_SECONDS = 5; //berapa attemp ini maksudnya
 const unsigned int NO_PROGRESS_STALL_SECONDS = 10;
 #define ACTIVATION_SETTLE_MS 1500
 #define PUMP_RELAY_COIL 10
+unsigned long HMI_POLL_INTERVAL_AUTO_MS = 500;
+unsigned long HMI_POLL_INTERVAL_MANUAL_MS = 50;
+unsigned long MODBUS_RETRY_DELAY_MS = 50;
+int MODBUS_WRITE_RETRY_COUNT = 3;
+unsigned long RELAY_CONTROL_PREPARE_MS = 50;
+unsigned long RELAY_CONTROL_SETTLE_MS = 50;
+unsigned long RELAY_VERIFY_DELAY_MS = 50;
+unsigned long PUMP_VERIFY_DELAY_MS = 50;
+unsigned long SENSOR_POLL_GAP_MS = 5;
+unsigned long ULTRASONIC_READ_RETRY_GAP_MS = 5;
+unsigned long HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS = 50;
 
 struct IrrigationScheduleItem {
   String time;
@@ -286,29 +255,17 @@ bool readUltrasonicSensor(ModbusMaster& node, uint16_t& distance, const char* se
     uint8_t lastError = 0;
     
     for (uint8_t i = 0; i < sizeof(registerCandidates)/sizeof(registerCandidates[0]) && !success; i++) {
-        // Add small delay to avoid bus collision
-        delay(10);
-        // Lindungi akses Modbus untuk menghindari collision lintas task
-        uint8_t result = 0;
-        if (takeRS485(pdMS_TO_TICKS(100))) {
-            result = node.readHoldingRegisters(registerCandidates[i], 1);
-            if (result == node.ku8MBSuccess) {
-                uint16_t raw = node.getResponseBuffer(0);
-                uint16_t valCm = raw / 10;
-                releaseRS485();
-                if (valCm >= 5 && valCm <= 750) {
-                    distance = valCm;
-                    consecutiveSensorErrors[2] = 0;
-                    return true;
-                }
-            } else {
-                releaseRS485();
+        delay(ULTRASONIC_READ_RETRY_GAP_MS);
+        uint8_t result = node.readHoldingRegisters(registerCandidates[i], 1);
+        if (result == node.ku8MBSuccess) {
+            uint16_t raw = node.getResponseBuffer(0);
+            uint16_t valCm = raw / 10;
+            if (valCm >= 5 && valCm <= 750) {
+                distance = valCm;
+                consecutiveSensorErrors[2] = 0;
+                return true;
             }
         } else {
-            // Jika tidak bisa obtain mutex, catat sebagai kegagalan ringan
-            result = node.ku8MBResponseTimedOut;
-        }
-        if (result != node.ku8MBSuccess) {
             lastError = result;
         }
     }
@@ -349,169 +306,127 @@ bool readWaterFlowSensor(ModbusMaster& node, float& flow, const char* sensorName
 
 // HMI Write Functions for Sensor Display
 void writeUltrasonicToHMI() {
-    // Lindungi akses RS485 selama write batch ke HMI
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0000, us1);
-      delay(10);
-      hmiNode.writeSingleRegister(0x0001, us2);
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0000, us1);
+    delay(10);
+    hmiNode.writeSingleRegister(0x0001, us2);
     int nutrPct = (int)((NUTRI_TANK_EMPTY_CM - us1) * 100 / (NUTRI_TANK_EMPTY_CM - NUTRI_TANK_FULL_CM));
     if (nutrPct < 0) nutrPct = 0;
     if (nutrPct > 100) nutrPct = 100;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0005, nutrPct);
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0005, nutrPct);
     delay(10);
     int airPct = (int)((WATER_TANK_EMPTY_CM - us2) * 100 / (WATER_TANK_EMPTY_CM - WATER_TANK_FULL_CM));
     if (airPct < 0) airPct = 0;
     if (airPct > 100) airPct = 100;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0006, airPct);
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0006, airPct);
 }
 
 void writeWaterFlowToHMI() {
     // Write water flow to HMI register LW3 as integer with 2 decimal places (x100)
     uint16_t wf = (uint16_t)(waterFlow * 100); // L/min with 2 decimals
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0003, wf); // LW3 - Water Flow
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0003, wf); // LW3 - Water Flow
     delayMicroseconds(2000);
 }
 
 void writeECSensorToHMI() {
     // Write EC sensor to HMI register LW4
     uint16_t ecVal = (uint16_t)ec;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0004, ecVal); // LW4 - EC
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0004, ecVal); // LW4 - EC
     delayMicroseconds(2000);
 }
 
 void writePressureToHMI() {
     // Write pressure to HMI register LW2 as integer with 2 decimal places (x100)
     uint16_t p = (uint16_t)(pressure * 100); // Bar with 2 decimals
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleRegister(0x0002, p); // LW2 - Pressure
-      releaseRS485();
-    }
+    hmiNode.writeSingleRegister(0x0002, p); // LW2 - Pressure
 }
 
 bool writeCoilWithRetry(uint16_t coil, bool state) {
   uint8_t lastErr = 0;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    uint8_t r = relayNode.ku8MBResponseTimedOut;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      r = relayNode.writeSingleCoil(coil, state ? 1 : 0);
-      releaseRS485();
-    }
+  for (int attempt = 0; attempt < MODBUS_WRITE_RETRY_COUNT; attempt++) {
+    uint8_t r = relayNode.writeSingleCoil(coil, state ? 1 : 0);
     if (r == relayNode.ku8MBSuccess) return true;
     lastErr = r;
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_DELAY_MS));
   }
   LOG_ERROR("Relay write failure coil:%u state:%u code:%u", coil, state?1:0, lastErr);
   return false;
 }
 
 bool controlRelayValve(int idx, bool open) {
-  unsigned long t0 = millis();
   int openCoil = idx * 2;
   int closeCoil = openCoil + 1;
-  // Matikan kedua coil sekali untuk mencegah konflik
-  bool offOpen = writeCoilWithRetry(openCoil, false);
-  bool offClose = writeCoilWithRetry(closeCoil, false);
-  bool ok = offOpen && offClose;
-  // Aktifkan coil target
-  ok = ok && writeCoilWithRetry(open ? openCoil : closeCoil, true);
-  vTaskDelay(pdMS_TO_TICKS(COIL_ACTION_DELAY_MS));
-  // Verifikasi cepat
-  uint8_t res = relayNode.ku8MBResponseTimedOut;
-  if (takeRS485(pdMS_TO_TICKS(50))) {
-    res = relayNode.readCoils(openCoil, 2);
-    if (res == relayNode.ku8MBSuccess) {
-      uint16_t word = relayNode.getResponseBuffer(0);
-      bool o = (word & 0x01) != 0;
-      bool c = (word & 0x02) != 0;
-      releaseRS485();
-      if (o && c) {
-        writeCoilWithRetry(openCoil, false);
-        writeCoilWithRetry(closeCoil, false);
-        LOG_ERROR("Relay conflict valve:%d", idx+1);
-        ok = false;
-      } else if (open && !o) {
-        ok = ok && writeCoilWithRetry(openCoil, true);
-      } else if (!open && !c) {
-        ok = ok && writeCoilWithRetry(closeCoil, true);
-      }
-    } else {
-      releaseRS485();
-      LOG_WARN("Relay read failure valve:%d code:%u", idx+1, res);
+  bool s1 = writeCoilWithRetry(openCoil, false);
+  bool s2 = writeCoilWithRetry(closeCoil, false);
+  vTaskDelay(pdMS_TO_TICKS(RELAY_CONTROL_PREPARE_MS));
+  bool ok = false;
+  if (open) {
+    bool a = writeCoilWithRetry(closeCoil, false);
+    bool b = writeCoilWithRetry(openCoil, true);
+    vTaskDelay(pdMS_TO_TICKS(RELAY_CONTROL_SETTLE_MS));
+    ok = a && b;
+  } else {
+    bool a = writeCoilWithRetry(openCoil, false);
+    bool b = writeCoilWithRetry(closeCoil, true);
+    vTaskDelay(pdMS_TO_TICKS(RELAY_CONTROL_SETTLE_MS));
+    ok = a && b;
+  }
+  uint8_t res = relayNode.readCoils(openCoil, 2);
+  if (res == relayNode.ku8MBSuccess) {
+    uint16_t word = relayNode.getResponseBuffer(0);
+    bool o = word & 0x01;
+    bool c = word & 0x02;
+    if (o && c) {
+      writeCoilWithRetry(openCoil, false);
+      writeCoilWithRetry(closeCoil, false);
+      LOG_ERROR("Relay conflict valve:%d", idx+1);
+      return false;
+    }
+    if (open && (!o || c)) {
+      writeCoilWithRetry(openCoil, true);
+      vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
+      LOG_WARN("Relay verify open mismatch valve:%d", idx+1);
+    }
+    if (!open && (!c || o)) {
+      writeCoilWithRetry(closeCoil, true);
+      vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
+      LOG_WARN("Relay verify close mismatch valve:%d", idx+1);
     }
   } else {
-    LOG_WARN("RS485 busy during relay verify valve:%d", idx+1);
+    LOG_WARN("Relay read failure valve:%d code:%u", idx+1, res);
   }
   xSemaphoreTake(xStateMutex, portMAX_DELAY);
   valveState[idx] = open;
   xSemaphoreGive(xStateMutex);
-  unsigned long dt = millis() - t0;
-  LOG_INFO("Valve %d set %s in %lums", idx+1, open?"OPEN":"CLOSE", dt);
   return ok;
 }
 
 bool controlPumpRelay(bool on) {
-  unsigned long t0 = millis();
   bool ok = writeCoilWithRetry(PUMP_RELAY_COIL, on);
-  vTaskDelay(pdMS_TO_TICKS(COIL_ACTION_DELAY_MS));
-  uint8_t res = relayNode.ku8MBResponseTimedOut;
-  if (takeRS485(pdMS_TO_TICKS(100))) {
-    res = relayNode.readCoils(PUMP_RELAY_COIL, 1);
-    if (res == relayNode.ku8MBSuccess) {
-      uint16_t word = relayNode.getResponseBuffer(0);
-      bool bit = word & 0x01;
-      releaseRS485();
-      if ((on && !bit) || (!on && bit)) {
-        LOG_WARN("Pump relay verify mismatch coil:%u", PUMP_RELAY_COIL);
-      }
-    } else {
-      releaseRS485();
-      LOG_WARN("Pump relay read failure code:%u", res);
+  vTaskDelay(pdMS_TO_TICKS(PUMP_VERIFY_DELAY_MS));
+  uint8_t res = relayNode.readCoils(PUMP_RELAY_COIL, 1);
+  if (res == relayNode.ku8MBSuccess) {
+    uint16_t word = relayNode.getResponseBuffer(0);
+    bool bit = word & 0x01;
+    if ((on && !bit) || (!on && bit)) {
+      LOG_WARN("Pump relay verify mismatch coil:%u", PUMP_RELAY_COIL);
     }
   } else {
-    LOG_WARN("RS485 busy during pump relay verify");
+    LOG_WARN("Pump relay read failure code:%u", res);
   }
   if (!ok) {
     LOG_ERROR("Pump relay write failure coil:%u state:%u", PUMP_RELAY_COIL, on?1:0);
     return false;
   }
   pumpState = on;
-  if (takeRS485(pdMS_TO_TICKS(100))) {
-    hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, on ? 1 : 0);
-    releaseRS485();
-  }
-  unsigned long dt = millis() - t0;
-  LOG_INFO("Pump %s set in %lums", on?"ON":"OFF", dt);
+  hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, on ? 1 : 0);
   return true;
 }
 
 // Function to read EC sensor with error handling
 bool readECSensor(ModbusMaster& node, float& ecValue, const char* sensorName) {
-    // Lindungi akses RS485 saat membaca EC
-    uint8_t result = 0;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-        result = node.readHoldingRegisters(0x0002, 1);
-        if (result == node.ku8MBSuccess) {
-            ecValue = node.getResponseBuffer(0);
-        }
-        releaseRS485();
-    } else {
-        result = node.ku8MBResponseTimedOut;
-    }
+    uint8_t result = node.readHoldingRegisters(0x0002, 1);
     if (result == node.ku8MBSuccess) {
+        ecValue = node.getResponseBuffer(0);
         consecutiveSensorErrors[1] = 0; // Reset error counter on success
         return true;
     } else {
@@ -780,11 +695,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       String m = String(doc["mode"].as<const char*>());
       m.toLowerCase();
       bool wantAuto = (m == "auto") || (doc["mode"] == true);
-      // Lindungi write ke HMI agar tidak bertabrakan dengan TaskModbus
-      if (takeRS485(pdMS_TO_TICKS(100))) {
-        hmiNode.writeSingleCoil(HMI_BTN_ADDR + MODE_SWITCH_INDEX, wantAuto ? 1 : 0);
-        releaseRS485();
-      }
+      hmiNode.writeSingleCoil(HMI_BTN_ADDR + MODE_SWITCH_INDEX, wantAuto ? 1 : 0);
       LOG_INFO("Received mode command: %s -> HMI LB6 set %d", m.c_str(), wantAuto?1:0);
       return;
     }
@@ -912,30 +823,14 @@ void TaskModbus(void* pv) {
   pinMode(PRESSURE_SENSOR_PIN, INPUT);
   LOG_INFO("Pressure sensor ADC initialized on pin %d", PRESSURE_SENSOR_PIN);
 
-  // Init known valve coils OFF (0..9) dengan retry & proteksi RS485
-  for (int i = 0; i < 10; i++) writeCoilWithRetry(i, false);
-  for (int i = 0; i < VALVE_COUNT; i++) {
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
-      releaseRS485();
-    }
-  }
-  if (takeRS485(pdMS_TO_TICKS(100))) {
-    hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
-    releaseRS485();
-  }
+  // Init known valve coils OFF (0..9)
+  for (int i = 0; i < 10; i++) relayNode.writeSingleCoil(i, 0);
+  for (int i = 0; i < VALVE_COUNT; i++) hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
+  hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
   LOG_INFO("Modbus initialized - all coils OFF");
 
-  for (int i = 0; i < VALVE_COUNT; i++) {
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      hmiNode.writeSingleCoil(HMI_BTN_ADDR + i, 0);
-      releaseRS485();
-    }
-  }
-  if (takeRS485(pdMS_TO_TICKS(100))) {
-    hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0);
-    releaseRS485();
-  }
+  for (int i = 0; i < VALVE_COUNT; i++) hmiNode.writeSingleCoil(HMI_BTN_ADDR + i, 0);
+  hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0);
   xSemaphoreTake(xStateMutex, portMAX_DELAY);
   for (int i = 0; i < VALVE_COUNT; i++) {
     valveState[i] = false;
@@ -956,13 +851,13 @@ void TaskModbus(void* pv) {
   for (;;) {
     if (!currentIrrigation.isActive || currentIrrigation.activationReady) {
       bool flowSuccess = readWaterFlowSensor(flowNode, waterFlow, "Flow Sensor");
-      delay(10);
+      delay(SENSOR_POLL_GAP_MS);
       bool ecSuccess = readECSensor(ecNode, ec, "EC Sensor");
-      delay(10);
+      delay(SENSOR_POLL_GAP_MS);
       bool us1Success = readUltrasonicSensor(us1Node, us1, "Ultrasonic1 Sensor");
-      delay(10);
+      delay(SENSOR_POLL_GAP_MS);
       bool us2Success = readUltrasonicSensor(us2Node, us2, "Ultrasonic2 Sensor");
-      delay(10);
+      delay(SENSOR_POLL_GAP_MS);
       bool pressureSuccess = readPressureSensor(pressure, "Pressure Sensor");
       focusedLogging = currentIrrigation.isActive;
       writeUltrasonicToHMI();
@@ -1046,11 +941,11 @@ void TaskModbus(void* pv) {
           LOG_WARN("Irrigation stalled, advancing to next schedule if available");
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
-            if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0); releaseRS485(); }
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
             vTaskDelay(pdMS_TO_TICKS(200));
           }
           controlPumpRelay(false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
@@ -1070,11 +965,11 @@ void TaskModbus(void* pv) {
           LOG_INFO("Target volume met, stopping irrigation");
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
-            if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0); releaseRS485(); }
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
             vTaskDelay(pdMS_TO_TICKS(200));
           }
           controlPumpRelay(false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
@@ -1085,11 +980,11 @@ void TaskModbus(void* pv) {
           LOG_WARN("Irrigation safety timeout, stopping");
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
-            if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0); releaseRS485(); }
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
             vTaskDelay(pdMS_TO_TICKS(200));
           }
           controlPumpRelay(false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
@@ -1100,39 +995,26 @@ void TaskModbus(void* pv) {
     }
 
     // Read HMI buttons
-    uint8_t res = 0;
-    uint16_t word = 0;
-    if (takeRS485(pdMS_TO_TICKS(100))) {
-      res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
-      if (res == hmiNode.ku8MBSuccess) {
-        word = hmiNode.getResponseBuffer(0);
-      }
-      releaseRS485();
-    } else {
-      res = hmiNode.ku8MBResponseTimedOut;
-    }
+    uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
     if (res == hmiNode.ku8MBSuccess) {
+      uint16_t word = hmiNode.getResponseBuffer(0);
       bool modeBit = (word >> MODE_SWITCH_INDEX) & 0x01;
       if (autoMode != modeBit) {
         autoMode = modeBit;
         LOG_INFO("Mode changed via HMI LB6: %s", autoMode?"AUTO":"MANUAL");
-        // Reset semua valve & lamp secara cepat
         for (int i = 0; i < VALVE_COUNT; i++) {
           controlRelayValve(i, false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0); releaseRS485(); }
-        }
-        // Reset pump
-        controlPumpRelay(false);
-        if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0); releaseRS485(); }
-        // Reset HMI button states ke OFF agar tidak ada state tersisa
-        for (int i = 0; i < VALVE_COUNT; i++) {
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_BTN_ADDR + i, 0); releaseRS485(); }
+          vTaskDelay(pdMS_TO_TICKS(HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS));
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
+          hmiNode.writeSingleCoil(HMI_BTN_ADDR + i, 0);
           lastValveState[i] = false;
-          webButtonChange[i] = false;
         }
-        if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0); releaseRS485(); }
+        controlPumpRelay(false);
+        hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
+        hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0);
         lastPumpBtnState = false;
-        webButtonChange[VALVE_COUNT] = false;
+        vTaskDelay(pdMS_TO_TICKS(200));
+        hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
         publishValveStatus();
       }
       for (int i = 0; i < VALVE_COUNT; i++) {
@@ -1147,10 +1029,7 @@ void TaskModbus(void* pv) {
           }
           if (webButtonChange[i]) {
             bool success = controlRelayValve(i, btn);
-            if (takeRS485(pdMS_TO_TICKS(100))) {
-              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
-              releaseRS485();
-            }
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
             if (!success) {
               LOG_ERROR("WEB control relay failure valve:%d", i+1);
             }
@@ -1159,10 +1038,7 @@ void TaskModbus(void* pv) {
             if (!focusedLogging) LOG_INFO("WEB control completed for valve %d", i+1);
           } else {
             bool success = controlRelayValve(i, btn);
-            if (takeRS485(pdMS_TO_TICKS(100))) {
-              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
-              releaseRS485();
-            }
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
             if (!success) {
               LOG_ERROR("HMI control relay failure valve:%d", i+1);
             }
@@ -1179,10 +1055,7 @@ void TaskModbus(void* pv) {
           
         } else if (webButtonChange[VALVE_COUNT]) {
           bool success = controlPumpRelay(pumpBtn);
-          if (takeRS485(pdMS_TO_TICKS(100))) {
-            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
-            releaseRS485();
-          }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
           if (!success) {
             LOG_ERROR("WEB control pump relay failure");
           }
@@ -1191,10 +1064,7 @@ void TaskModbus(void* pv) {
           if (!focusedLogging) LOG_INFO("WEB control completed for pump %s", pumpBtn?"ON":"OFF");
         } else {
           bool success = controlPumpRelay(pumpBtn);
-          if (takeRS485(pdMS_TO_TICKS(100))) {
-            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
-            releaseRS485();
-          }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
           if (!success) {
             LOG_ERROR("HMI control pump relay failure");
           }
@@ -1206,7 +1076,7 @@ void TaskModbus(void* pv) {
       LOG_WARN("HMI button read failure - error code: %u", res);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(HMI_SCAN_INTERVAL_MS));
+    vTaskDelay(pdMS_TO_TICKS(autoMode ? HMI_POLL_INTERVAL_AUTO_MS : HMI_POLL_INTERVAL_MANUAL_MS));
   }
 }
 
@@ -1252,7 +1122,7 @@ void TaskMQTTRecv(void* pv) {
   LOG_INFO("Starting MQTT Receive Task");
   for (;;) {
     ControlCmd cmd;
-    if (xQueueReceive(xCmdQueue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(xCmdQueue, &cmd, pdMS_TO_TICKS(HMI_POLL_INTERVAL_MANUAL_MS)) == pdTRUE) {
       if (autoMode) {
         continue;
       }
@@ -1262,11 +1132,7 @@ void TaskMQTTRecv(void* pv) {
       }
       LOG_INFO("Processing WEB control - Valve %d %s", cmd.idx+1, cmd.open?"OPEN":"CLOSE");
       webButtonChange[cmd.idx] = true;
-      // Lindungi write ke HMI agar aman lintas task
-      if (takeRS485(pdMS_TO_TICKS(100))) {
-        hmiNode.writeSingleCoil(HMI_BTN_ADDR + cmd.idx, cmd.open ? 1 : 0);
-        releaseRS485();
-      }
+      hmiNode.writeSingleCoil(HMI_BTN_ADDR + cmd.idx, cmd.open ? 1 : 0);
       LOG_INFO("WEB control - HMI button %d set to %s, waiting for TaskModbus to execute", cmd.idx+1, cmd.open?"ON":"OFF");
     }
   }
@@ -1276,13 +1142,6 @@ void TaskMQTTRecv(void* pv) {
 void setup() {
   Serial.begin(115200);
   LOG_INFO("System starting - FreeRTOS Irrigation Controller");
-  // Inisialisasi mutex RS485 untuk melindungi akses Modbus lintas task
-  xRS485Mutex = xSemaphoreCreateMutex();
-  if (xRS485Mutex == NULL) {
-    LOG_WARN("Failed to create RS485 mutex; Modbus operations may collide");
-  }
-  // Jalankan self-test konversi float untuk memverifikasi perbaikan urutan word
-  selfTestFloatConversions();
 
   xSensorQueue = xQueueCreate(8, sizeof(float[3]));
   xCmdQueue = xQueueCreate(8, sizeof(ControlCmd));
@@ -1357,24 +1216,24 @@ void setup() {
         bool allOk = true;
         if (isAirOnly) {
           bool ok0 = controlRelayValve(0, false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0);
           vTaskDelay(pdMS_TO_TICKS(300));
           bool ok1 = controlRelayValve(1, true);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         } else if (isAirNutrisi) {
           bool ok0 = controlRelayValve(0, true);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 1); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 1);
           vTaskDelay(pdMS_TO_TICKS(300));
           bool ok1 = controlRelayValve(1, true);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         } else {
           bool ok0 = controlRelayValve(0, false);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0);
           vTaskDelay(pdMS_TO_TICKS(300));
           bool ok1 = controlRelayValve(1, true);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         }
         vTaskDelay(pdMS_TO_TICKS(300));
@@ -1382,14 +1241,14 @@ void setup() {
           int idx = v - 1;
           bool on = (v == currentIrrigation.landRelay);
           bool okv = controlRelayValve(idx, on);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + idx, on ? 1 : 0); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + idx, on ? 1 : 0);
           vTaskDelay(pdMS_TO_TICKS(300));
           allOk = allOk && okv;
         }
         {
           int landIdx = currentIrrigation.landRelay - 1;
           bool okLand = controlRelayValve(landIdx, true);
-          if (takeRS485(pdMS_TO_TICKS(100))) { hmiNode.writeSingleCoil(HMI_LAMP_ADDR + landIdx, 1); releaseRS485(); }
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + landIdx, 1);
           vTaskDelay(pdMS_TO_TICKS(300));
           allOk = allOk && okLand;
         }
