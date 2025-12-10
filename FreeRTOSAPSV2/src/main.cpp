@@ -102,7 +102,9 @@ float regsToFloatLH(uint16_t low, uint16_t high) {
 }
 
 bool readFloat32Holding(ModbusMaster& node, uint16_t addr, float &out) {
+  esp_task_wdt_reset();
   uint8_t res = node.readHoldingRegisters(addr, 2);
+  esp_task_wdt_reset();
   if (res != node.ku8MBSuccess) return false;
   uint16_t w0 = node.getResponseBuffer(0);
   uint16_t w1 = node.getResponseBuffer(1);
@@ -173,17 +175,25 @@ const unsigned int NO_PROGRESS_STALL_SECONDS = 10;
 #define ACTIVATION_SETTLE_MS 1500
 #define PUMP_RELAY_COIL 10
 unsigned long HMI_POLL_INTERVAL_AUTO_MS = 500;
-unsigned long HMI_POLL_INTERVAL_MANUAL_MS = 50;
-unsigned long MODBUS_RETRY_DELAY_MS = 50;
-int MODBUS_WRITE_RETRY_COUNT = 3;
-unsigned long RELAY_CONTROL_PREPARE_MS = 50;
-unsigned long RELAY_CONTROL_SETTLE_MS = 50;
-unsigned long RELAY_VERIFY_DELAY_MS = 50;
-unsigned long PUMP_VERIFY_DELAY_MS = 50;
-unsigned long SENSOR_POLL_GAP_MS = 5;
-unsigned long ULTRASONIC_READ_RETRY_GAP_MS = 5;
-unsigned long HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS = 50;
+unsigned long HMI_POLL_INTERVAL_MANUAL_MS = 5;
+unsigned long MODBUS_RETRY_DELAY_MS = 1;
+int MODBUS_WRITE_RETRY_COUNT = 2;
+unsigned long RELAY_CONTROL_PREPARE_MS = 2;
+unsigned long RELAY_CONTROL_SETTLE_MS = 2;
+unsigned long RELAY_VERIFY_DELAY_MS = 2;
+unsigned long PUMP_VERIFY_DELAY_MS = 2;
+unsigned long SENSOR_POLL_GAP_MS = 1;
+unsigned long ULTRASONIC_READ_RETRY_GAP_MS = 15; //15 maksimal
+unsigned long HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS = 5;
+unsigned long HMI_WRITE_DELAY_MS = 2;
+unsigned long EC_RETRY_DELAY_MS = 15; //15 maksimal
+unsigned long PRESSURE_ADC_DELAY_US = 1000;
+unsigned long IRRIGATION_STEP_DELAY_MS = 200;
+unsigned long IRRIGATION_VALVE_DELAY_MS = 300;
+unsigned long lastHMIProcess = 0;
+static const uint8_t READ_RETRY = 3;
 
+    
 struct IrrigationScheduleItem {
   String time;
   bool isActive;
@@ -247,37 +257,40 @@ static void publishScheduleFeedback(int valveIdx, const char* action, const char
 
 // ===== SENSOR READING FUNCTIONS =====
 
-// Function to read ultrasonic sensor with error handling and multiple register attempts
-bool readUltrasonicSensor(ModbusMaster& node, uint16_t& distance, const char* sensorName) {
-    // Try multiple register addresses (common ultrasonic sensor registers)
-    const uint16_t registerCandidates[] = {0x0000, 0x0001, 0x0100, 0x0101, 0x0010};
-    bool success = false;
-    uint8_t lastError = 0;
-    
-    for (uint8_t i = 0; i < sizeof(registerCandidates)/sizeof(registerCandidates[0]) && !success; i++) {
+// Function to read ultrasonic sensor with error handling (Prioritize 0x0100, then 0x0101, fallback 0x0001)
+bool readUltrasonicSensor(ModbusMaster& node, uint16_t& distance, const char* sensorName, int errorIndex) {
+    // Candidates: 0x0100 (Std), 0x0101 (Alt), 0x0001 (User fallback)
+    const uint16_t candidates[] = {0x0100};
+    uint8_t result = node.ku8MBResponseTimedOut;
+
+    for (uint16_t reg : candidates) {
+        esp_task_wdt_reset();
         delay(ULTRASONIC_READ_RETRY_GAP_MS);
-        uint8_t result = node.readHoldingRegisters(registerCandidates[i], 1);
+        node.clearResponseBuffer();
+        result = node.readHoldingRegisters(reg, 1);
+        esp_task_wdt_reset();
+        
         if (result == node.ku8MBSuccess) {
             uint16_t raw = node.getResponseBuffer(0);
+            // Convert to cm (assuming raw is mm)
             uint16_t valCm = raw / 10;
+            
             if (valCm >= 5 && valCm <= 750) {
                 distance = valCm;
-                consecutiveSensorErrors[2] = 0;
+                consecutiveSensorErrors[errorIndex] = 0;
                 return true;
             }
-        } else {
-            lastError = result;
         }
     }
     
     // Increment consecutive error counter
-    consecutiveSensorErrors[2]++;
+    consecutiveSensorErrors[errorIndex]++;
     
-    // Only log error if we've exceeded the threshold (to ignore intermittent failures)
-    if (consecutiveSensorErrors[2] >= MAX_CONSECUTIVE_ERRORS) {
-        if (millis() - lastSensorFail[2] > SENSOR_FAIL_LOG_INTERVAL) {
-            LOG_ERROR("%s read failure after multiple attempts - error code: %u", sensorName, lastError);
-            lastSensorFail[2] = millis();
+    // Only log error if we've exceeded the threshold
+    if (consecutiveSensorErrors[errorIndex] >= MAX_CONSECUTIVE_ERRORS) {
+        if (millis() - lastSensorFail[errorIndex] > SENSOR_FAIL_LOG_INTERVAL) {
+            LOG_ERROR("%s read failure - last error: 0x%02X", sensorName, result);
+            lastSensorFail[errorIndex] = millis();
         }
     }
     
@@ -307,13 +320,13 @@ bool readWaterFlowSensor(ModbusMaster& node, float& flow, const char* sensorName
 // HMI Write Functions for Sensor Display
 void writeUltrasonicToHMI() {
     hmiNode.writeSingleRegister(0x0000, us1);
-    delay(10);
+    delay(HMI_WRITE_DELAY_MS);
     hmiNode.writeSingleRegister(0x0001, us2);
     int nutrPct = (int)((NUTRI_TANK_EMPTY_CM - us1) * 100 / (NUTRI_TANK_EMPTY_CM - NUTRI_TANK_FULL_CM));
     if (nutrPct < 0) nutrPct = 0;
     if (nutrPct > 100) nutrPct = 100;
     hmiNode.writeSingleRegister(0x0005, nutrPct);
-    delay(10);
+    delay(HMI_WRITE_DELAY_MS);
     int airPct = (int)((WATER_TANK_EMPTY_CM - us2) * 100 / (WATER_TANK_EMPTY_CM - WATER_TANK_FULL_CM));
     if (airPct < 0) airPct = 0;
     if (airPct > 100) airPct = 100;
@@ -324,14 +337,14 @@ void writeWaterFlowToHMI() {
     // Write water flow to HMI register LW3 as integer with 2 decimal places (x100)
     uint16_t wf = (uint16_t)(waterFlow * 100); // L/min with 2 decimals
     hmiNode.writeSingleRegister(0x0003, wf); // LW3 - Water Flow
-    delayMicroseconds(2000);
+    delay(HMI_WRITE_DELAY_MS);
 }
 
 void writeECSensorToHMI() {
     // Write EC sensor to HMI register LW4
     uint16_t ecVal = (uint16_t)ec;
     hmiNode.writeSingleRegister(0x0004, ecVal); // LW4 - EC
-    delayMicroseconds(2000);
+    delay(HMI_WRITE_DELAY_MS);
 }
 
 void writePressureToHMI() {
@@ -343,7 +356,9 @@ void writePressureToHMI() {
 bool writeCoilWithRetry(uint16_t coil, bool state) {
   uint8_t lastErr = 0;
   for (int attempt = 0; attempt < MODBUS_WRITE_RETRY_COUNT; attempt++) {
+    esp_task_wdt_reset();
     uint8_t r = relayNode.writeSingleCoil(coil, state ? 1 : 0);
+    esp_task_wdt_reset();
     if (r == relayNode.ku8MBSuccess) return true;
     lastErr = r;
     vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_DELAY_MS));
@@ -355,9 +370,6 @@ bool writeCoilWithRetry(uint16_t coil, bool state) {
 bool controlRelayValve(int idx, bool open) {
   int openCoil = idx * 2;
   int closeCoil = openCoil + 1;
-  bool s1 = writeCoilWithRetry(openCoil, false);
-  bool s2 = writeCoilWithRetry(closeCoil, false);
-  vTaskDelay(pdMS_TO_TICKS(RELAY_CONTROL_PREPARE_MS));
   bool ok = false;
   if (open) {
     bool a = writeCoilWithRetry(closeCoil, false);
@@ -370,29 +382,31 @@ bool controlRelayValve(int idx, bool open) {
     vTaskDelay(pdMS_TO_TICKS(RELAY_CONTROL_SETTLE_MS));
     ok = a && b;
   }
-  uint8_t res = relayNode.readCoils(openCoil, 2);
-  if (res == relayNode.ku8MBSuccess) {
-    uint16_t word = relayNode.getResponseBuffer(0);
-    bool o = word & 0x01;
-    bool c = word & 0x02;
-    if (o && c) {
-      writeCoilWithRetry(openCoil, false);
-      writeCoilWithRetry(closeCoil, false);
-      LOG_ERROR("Relay conflict valve:%d", idx+1);
-      return false;
+  if (autoMode) {
+    uint8_t res = relayNode.readCoils(openCoil, 2);
+    if (res == relayNode.ku8MBSuccess) {
+      uint16_t word = relayNode.getResponseBuffer(0);
+      bool o = word & 0x01;
+      bool c = word & 0x02;
+      if (o && c) {
+        writeCoilWithRetry(openCoil, false);
+        writeCoilWithRetry(closeCoil, false);
+        LOG_ERROR("Relay conflict valve:%d", idx+1);
+        return false;
+      }
+      if (open && (!o || c)) {
+        writeCoilWithRetry(openCoil, true);
+        vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
+        LOG_WARN("Relay verify open mismatch valve:%d", idx+1);
+      }
+      if (!open && (!c || o)) {
+        writeCoilWithRetry(closeCoil, true);
+        vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
+        LOG_WARN("Relay verify close mismatch valve:%d", idx+1);
+      }
+    } else {
+      LOG_WARN("Relay read failure valve:%d code:%u", idx+1, res);
     }
-    if (open && (!o || c)) {
-      writeCoilWithRetry(openCoil, true);
-      vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
-      LOG_WARN("Relay verify open mismatch valve:%d", idx+1);
-    }
-    if (!open && (!c || o)) {
-      writeCoilWithRetry(closeCoil, true);
-      vTaskDelay(pdMS_TO_TICKS(RELAY_VERIFY_DELAY_MS));
-      LOG_WARN("Relay verify close mismatch valve:%d", idx+1);
-    }
-  } else {
-    LOG_WARN("Relay read failure valve:%d code:%u", idx+1, res);
   }
   xSemaphoreTake(xStateMutex, portMAX_DELAY);
   valveState[idx] = open;
@@ -403,15 +417,17 @@ bool controlRelayValve(int idx, bool open) {
 bool controlPumpRelay(bool on) {
   bool ok = writeCoilWithRetry(PUMP_RELAY_COIL, on);
   vTaskDelay(pdMS_TO_TICKS(PUMP_VERIFY_DELAY_MS));
-  uint8_t res = relayNode.readCoils(PUMP_RELAY_COIL, 1);
-  if (res == relayNode.ku8MBSuccess) {
-    uint16_t word = relayNode.getResponseBuffer(0);
-    bool bit = word & 0x01;
-    if ((on && !bit) || (!on && bit)) {
-      LOG_WARN("Pump relay verify mismatch coil:%u", PUMP_RELAY_COIL);
+  if (autoMode) {
+    uint8_t res = relayNode.readCoils(PUMP_RELAY_COIL, 1);
+    if (res == relayNode.ku8MBSuccess) {
+      uint16_t word = relayNode.getResponseBuffer(0);
+      bool bit = word & 0x01;
+      if ((on && !bit) || (!on && bit)) {
+        LOG_WARN("Pump relay verify mismatch coil:%u", PUMP_RELAY_COIL);
+      }
+    } else {
+      LOG_WARN("Pump relay read failure code:%u", res);
     }
-  } else {
-    LOG_WARN("Pump relay read failure code:%u", res);
   }
   if (!ok) {
     LOG_ERROR("Pump relay write failure coil:%u state:%u", PUMP_RELAY_COIL, on?1:0);
@@ -424,36 +440,50 @@ bool controlPumpRelay(bool on) {
 
 // Function to read EC sensor with error handling
 bool readECSensor(ModbusMaster& node, float& ecValue, const char* sensorName) {
-    uint8_t result = node.readHoldingRegisters(0x0002, 1);
-    if (result == node.ku8MBSuccess) {
-        ecValue = node.getResponseBuffer(0);
-        consecutiveSensorErrors[1] = 0; // Reset error counter on success
-        return true;
-    } else {
-        consecutiveSensorErrors[1]++;
-        
-        // Only log error if we've exceeded the threshold (to ignore intermittent failures)
-        if (consecutiveSensorErrors[1] >= MAX_CONSECUTIVE_ERRORS) {
-            if (millis() - lastSensorFail[1] > SENSOR_FAIL_LOG_INTERVAL) {
-                LOG_ERROR("%s read failure - error code: %u", sensorName, result);
-                lastSensorFail[1] = millis();
-            }
+    uint8_t rc = 0xFF;
+
+    for (uint8_t i = 0; i < READ_RETRY; i++) {
+        esp_task_wdt_reset();
+        // Bersihkan sisa data di buffer serial agar transaksi Modbus bersih
+        unsigned long flushStart = millis();
+        while (rs485.available() && (millis() - flushStart < 100)) {
+            rs485.read();
         }
-        ecValue = 0.0;
-        return false;
+
+        rc = node.readHoldingRegisters(0x0002, 1);  // REG_EC = 0x0002
+        esp_task_wdt_reset();
+        if (rc == node.ku8MBSuccess) {
+            ecValue = node.getResponseBuffer(0);     // nilai uint16, unit µS/cm
+            consecutiveSensorErrors[1] = 0;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(EC_RETRY_DELAY_MS));
     }
+
+    // Gagal setelah retry
+    consecutiveSensorErrors[1]++;
+    if (consecutiveSensorErrors[1] >= MAX_CONSECUTIVE_ERRORS) {
+        if (millis() - lastSensorFail[1] > SENSOR_FAIL_LOG_INTERVAL) {
+            LOG_ERROR("%s read failure - error code: %u", sensorName, rc); // 226 = ResponseTimedOut
+            lastSensorFail[1] = millis();
+        }
+    }
+    ecValue = 0.0f;
+    return false;
 }
 
 // Function to read pressure sensor (4-20mA ADC) with EMA filtering
 bool readPressureSensor(float& pressureValue, const char* sensorName) {
+    esp_task_wdt_reset();
     static float filteredCurrent = 0.0; // EMA filtered current value
     static bool firstReading = true;
     
     unsigned long sum = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
         sum += analogRead(PRESSURE_SENSOR_PIN);
-        delayMicroseconds(2000); // 2ms delay
+        delayMicroseconds(PRESSURE_ADC_DELAY_US);
     }
+    esp_task_wdt_reset();
     
     // Calculate average voltage (mV)
     float voltageMv = (sum / (float)ADC_SAMPLES) / 4096.0 * VREF;
@@ -474,16 +504,16 @@ bool readPressureSensor(float& pressureValue, const char* sensorName) {
     if (filteredCurrent >= MIN_CURRENT && filteredCurrent <= MAX_CURRENT) {
         // Convert current to pressure (0-10 Bar range)
         pressureValue = ((filteredCurrent - MIN_CURRENT) / (MAX_CURRENT - MIN_CURRENT)) * MAX_PRESSURE;
-        consecutiveSensorErrors[3] = 0; // Reset error counter on success
+        consecutiveSensorErrors[4] = 0; // Reset error counter on success
         return true;
     } else {
-        consecutiveSensorErrors[3]++;
+        consecutiveSensorErrors[4]++;
         
         // Only log error if we've exceeded the threshold (to ignore intermittent failures)
-        if (consecutiveSensorErrors[3] >= MAX_CONSECUTIVE_ERRORS) {
-            if (millis() - lastSensorFail[3] > SENSOR_FAIL_LOG_INTERVAL) {
+        if (consecutiveSensorErrors[4] >= MAX_CONSECUTIVE_ERRORS) {
+            if (millis() - lastSensorFail[4] > SENSOR_FAIL_LOG_INTERVAL) {
                 LOG_ERROR("%s current out of range: %.2f mA (expected 4-20mA), filtered: %.2f mA", sensorName, currentmA, filteredCurrent);
-                lastSensorFail[3] = millis();
+                lastSensorFail[4] = millis();
             }
         }
         pressureValue = 0.0;
@@ -705,7 +735,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       if (idx >= 0 && idx < VALVE_COUNT + 1) {
         LOG_INFO("Web control request - Valve %d %s", idx+1, open?"OPEN":"CLOSE");
         ControlCmd cmd{ idx, open };
-        xQueueSend(xCmdQueue, &cmd, 0);
+        xQueueSend(xCmdQueue, &cmd, pdMS_TO_TICKS(100));
         LOG_INFO("MQTT target %d set to %s - HMI state will be updated", idx+1, open?"OPEN":"CLOSE");
       } else {
         LOG_WARN("Invalid valve index: %d", idx+1);
@@ -811,6 +841,7 @@ void TaskMQTT(void* pv) {
 // Task Modbus
 void TaskModbus(void* pv) {
   LOG_INFO("Starting Modbus Task");
+  esp_task_wdt_add(NULL);
   rs485.begin(BAUD_RATE, SERIAL_8N1, RS485_RX, RS485_TX);
   hmiNode.begin(HMI_ID, rs485);
   relayNode.begin(RELAY_ID, rs485);
@@ -818,7 +849,7 @@ void TaskModbus(void* pv) {
   ecNode.begin(EC_ID, rs485);
   us1Node.begin(US1_ID, rs485);
   us2Node.begin(US2_ID, rs485);
-
+  
   // Initialize pressure sensor ADC pin
   pinMode(PRESSURE_SENSOR_PIN, INPUT);
   LOG_INFO("Pressure sensor ADC initialized on pin %d", PRESSURE_SENSOR_PIN);
@@ -849,16 +880,175 @@ void TaskModbus(void* pv) {
   LOG_INFO("Startup reset: all valves OFF, HMI buttons and lamps cleared");
 
   for (;;) {
+    esp_task_wdt_reset();
+    {
+      uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+      if (res == hmiNode.ku8MBSuccess) {
+        uint16_t word = hmiNode.getResponseBuffer(0);
+        bool modeBit = (word >> MODE_SWITCH_INDEX) & 0x01;
+        if (autoMode != modeBit) {
+          autoMode = modeBit;
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            controlRelayValve(i, false);
+            vTaskDelay(pdMS_TO_TICKS(HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS));
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
+            hmiNode.writeSingleCoil(HMI_BTN_ADDR + i, 0);
+            lastValveState[i] = false;
+          }
+          controlPumpRelay(false);
+          hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
+          hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0);
+          lastPumpBtnState = false;
+          publishValveStatus();
+        }
+        for (int i = 0; i < VALVE_COUNT; i++) {
+          bool btn = (word >> i) & 0x01;
+          if (btn != lastValveState[i]) {
+            lastValveState[i] = btn;
+            xSemaphoreTake(xStateMutex, portMAX_DELAY);
+            valveState[i] = btn;
+            xSemaphoreGive(xStateMutex);
+            if (!autoMode) {
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              if (webButtonChange[i]) webButtonChange[i] = false;
+              publishValveStatus();
+            }
+          }
+        }
+        bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+        if (pumpBtn != lastPumpBtnState) {
+          lastPumpBtnState = pumpBtn;
+          if (!autoMode) {
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            if (webButtonChange[VALVE_COUNT]) webButtonChange[VALVE_COUNT] = false;
+            publishValveStatus();
+          }
+        }
+        lastHMIProcess = millis();
+      }
+    }
     if (!currentIrrigation.isActive || currentIrrigation.activationReady) {
       bool flowSuccess = readWaterFlowSensor(flowNode, waterFlow, "Flow Sensor");
       delay(SENSOR_POLL_GAP_MS);
+      {
+        uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+        if (res == hmiNode.ku8MBSuccess) {
+          uint16_t word = hmiNode.getResponseBuffer(0);
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            bool btn = (word >> i) & 0x01;
+            if (!autoMode && btn != lastValveState[i]) {
+              lastValveState[i] = btn;
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              publishValveStatus();
+            }
+          }
+          bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+          if (!autoMode && pumpBtn != lastPumpBtnState) {
+            lastPumpBtnState = pumpBtn;
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            publishValveStatus();
+          }
+        }
+      }
       bool ecSuccess = readECSensor(ecNode, ec, "EC Sensor");
       delay(SENSOR_POLL_GAP_MS);
-      bool us1Success = readUltrasonicSensor(us1Node, us1, "Ultrasonic1 Sensor");
+      {
+        uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+        if (res == hmiNode.ku8MBSuccess) {
+          uint16_t word = hmiNode.getResponseBuffer(0);
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            bool btn = (word >> i) & 0x01;
+            if (!autoMode && btn != lastValveState[i]) {
+              lastValveState[i] = btn;
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              publishValveStatus();
+            }
+          }
+          bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+          if (!autoMode && pumpBtn != lastPumpBtnState) {
+            lastPumpBtnState = pumpBtn;
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            publishValveStatus();
+          }
+        }
+      }
+      bool us1Success = readUltrasonicSensor(us1Node, us1, "Ultrasonic1 Sensor", 2);
       delay(SENSOR_POLL_GAP_MS);
-      bool us2Success = readUltrasonicSensor(us2Node, us2, "Ultrasonic2 Sensor");
+      {
+        uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+        if (res == hmiNode.ku8MBSuccess) {
+          uint16_t word = hmiNode.getResponseBuffer(0);
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            bool btn = (word >> i) & 0x01;
+            if (!autoMode && btn != lastValveState[i]) {
+              lastValveState[i] = btn;
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              publishValveStatus();
+            }
+          }
+          bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+          if (!autoMode && pumpBtn != lastPumpBtnState) {
+            lastPumpBtnState = pumpBtn;
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            publishValveStatus();
+          }
+        }
+      }
+      bool us2Success = readUltrasonicSensor(us2Node, us2, "Ultrasonic2 Sensor", 3);
       delay(SENSOR_POLL_GAP_MS);
+      {
+        uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+        if (res == hmiNode.ku8MBSuccess) {
+          uint16_t word = hmiNode.getResponseBuffer(0);
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            bool btn = (word >> i) & 0x01;
+            if (!autoMode && btn != lastValveState[i]) {
+              lastValveState[i] = btn;
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              publishValveStatus();
+            }
+          }
+          bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+          if (!autoMode && pumpBtn != lastPumpBtnState) {
+            lastPumpBtnState = pumpBtn;
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            publishValveStatus();
+          }
+        }
+      }
       bool pressureSuccess = readPressureSensor(pressure, "Pressure Sensor");
+      {
+        uint8_t res = hmiNode.readCoils(HMI_BTN_ADDR, VALVE_COUNT + 2);
+        if (res == hmiNode.ku8MBSuccess) {
+          uint16_t word = hmiNode.getResponseBuffer(0);
+          for (int i = 0; i < VALVE_COUNT; i++) {
+            bool btn = (word >> i) & 0x01;
+            if (!autoMode && btn != lastValveState[i]) {
+              lastValveState[i] = btn;
+              controlRelayValve(i, btn);
+              hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, btn ? 1 : 0);
+              publishValveStatus();
+            }
+          }
+          bool pumpBtn = (word >> PUMP_BTN_INDEX) & 0x01;
+          if (!autoMode && pumpBtn != lastPumpBtnState) {
+            lastPumpBtnState = pumpBtn;
+            controlPumpRelay(pumpBtn);
+            hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, pumpBtn ? 1 : 0);
+            publishValveStatus();
+          }
+        }
+      }
       focusedLogging = currentIrrigation.isActive;
       writeUltrasonicToHMI();
       writeWaterFlowToHMI();
@@ -942,7 +1132,7 @@ void TaskModbus(void* pv) {
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
             hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
           }
           controlPumpRelay(false);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
@@ -966,7 +1156,7 @@ void TaskModbus(void* pv) {
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
             hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
           }
           controlPumpRelay(false);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
@@ -981,7 +1171,7 @@ void TaskModbus(void* pv) {
           for (int i = 0; i < VALVE_COUNT; i++) {
             controlRelayValve(i, false);
             hmiNode.writeSingleCoil(HMI_LAMP_ADDR + i, 0);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
           }
           controlPumpRelay(false);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
@@ -1013,7 +1203,7 @@ void TaskModbus(void* pv) {
         hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
         hmiNode.writeSingleCoil(HMI_BTN_ADDR + PUMP_BTN_INDEX, 0);
         lastPumpBtnState = false;
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(HMI_MODE_CHANGE_RELAY_OFF_DELAY_MS));
         hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, 0);
         publishValveStatus();
       }
@@ -1170,8 +1360,8 @@ void setup() {
     }
   }
 
-  // Watchdog 10 detik
-  esp_task_wdt_init(10, true);
+  // Watchdog 30 detik
+  esp_task_wdt_init(30, true);
   esp_task_wdt_add(NULL);
 
   rtcInitialized = rtc.begin();
@@ -1201,13 +1391,13 @@ void setup() {
         currentIrrigation.scheduleIndex = job.scheduleIndex;
         for (int k = 0; k < VALVE_COUNT; k++) {
           controlRelayValve(k, false);
-          vTaskDelay(pdMS_TO_TICKS(200));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
         }
         controlPumpRelay(false);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
         for (int k = 0; k < VALVE_COUNT; k++) {
           controlRelayValve(k, false);
-          vTaskDelay(pdMS_TO_TICKS(200));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_STEP_DELAY_MS));
         }
         controlPumpRelay(false);
         vTaskDelay(pdMS_TO_TICKS(ACTIVATION_SETTLE_MS));
@@ -1217,43 +1407,43 @@ void setup() {
         if (isAirOnly) {
           bool ok0 = controlRelayValve(0, false);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           bool ok1 = controlRelayValve(1, true);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         } else if (isAirNutrisi) {
           bool ok0 = controlRelayValve(0, true);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 1);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           bool ok1 = controlRelayValve(1, true);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         } else {
           bool ok0 = controlRelayValve(0, false);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 0, 0);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           bool ok1 = controlRelayValve(1, true);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + 1, 1);
           allOk = ok0 && ok1;
         }
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
         for (int v = 3; v <= 5; v++) {
           int idx = v - 1;
           bool on = (v == currentIrrigation.landRelay);
           bool okv = controlRelayValve(idx, on);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + idx, on ? 1 : 0);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           allOk = allOk && okv;
         }
         {
           int landIdx = currentIrrigation.landRelay - 1;
           bool okLand = controlRelayValve(landIdx, true);
           hmiNode.writeSingleCoil(HMI_LAMP_ADDR + landIdx, 1);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           allOk = allOk && okLand;
         }
         if (allOk) {
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(IRRIGATION_VALVE_DELAY_MS));
           controlPumpRelay(true);
           currentIrrigation.activationReady = true;
           LOG_INFO("Irrigation started for %s schedule:%d target:%.2fL", currentIrrigation.landName.c_str(), currentIrrigation.scheduleIndex+1, currentIrrigation.waterNeeded);
