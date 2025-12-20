@@ -59,6 +59,7 @@ const char* topic_irrigation_ack = "silagung/irrigation/ack";
 #define EC_ID 1
 #define US1_ID 4
 #define US2_ID 5
+#define VFD_ID 7
 
 // Valve & HMI
 #define VALVE_COUNT 5
@@ -79,6 +80,13 @@ const char* topic_irrigation_ack = "silagung/irrigation/ack";
 #define MIN_CURRENT 4.0           // Minimum current for 4-20mA sensor
 #define MAX_CURRENT 20.0          // Maximum current for 4-20mA sensor
 #define MAX_PRESSURE 10.0         // Maximum pressure in Bar (0-10 Bar)
+
+static constexpr float VFD_MAX_ALLOWED_HZ = 50.0f;
+static constexpr uint16_t VFD_REG_CONTROL_COMMAND = 0x2000;
+static constexpr uint16_t VFD_REG_COMM_SET_FREQUENCY = 0x2001;
+static constexpr uint16_t VFD_REG_RUN_STATUS = 0x2101;
+static constexpr uint16_t VFD_CMD_STOP = 0x0001;
+static constexpr uint16_t VFD_CMD_RUN_FWD = 0x0012;
 
 // Utility function to convert Modbus registers to float
 float registersToFloat(uint16_t r1, uint16_t r2) {
@@ -138,6 +146,9 @@ float pressure = 0.0;  // Add pressure variable
 bool pumpState = false;
 bool lastPumpBtnState = false;
 bool autoMode = false;
+uint16_t lastHmiVfdFreqRaw = 0xFFFF;
+unsigned long lastHmiVfdFreqPoll = 0;
+float vfdFrequencyHz = 0.0f;
 
 // Logging state tracking
 bool lastDisplayEmpty = false;
@@ -153,7 +164,7 @@ const uint8_t MAX_CONSECUTIVE_ERRORS = 10; // Ignore errors until this threshold
 
 // Objects
 HardwareSerial rs485(1);
-ModbusMaster hmiNode, relayNode, flowNode, ecNode, us1Node, us2Node;
+ModbusMaster hmiNode, relayNode, flowNode, ecNode, us1Node, us2Node, vfdNode;
 WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
@@ -319,17 +330,18 @@ bool readWaterFlowSensor(ModbusMaster& node, float& flow, const char* sensorName
 
 // HMI Write Functions for Sensor Display
 void writeUltrasonicToHMI() {
-    hmiNode.writeSingleRegister(0x0000, us1);
-    delay(HMI_WRITE_DELAY_MS);
-    hmiNode.writeSingleRegister(0x0001, us2);
     int nutrPct = (int)((NUTRI_TANK_EMPTY_CM - us1) * 100 / (NUTRI_TANK_EMPTY_CM - NUTRI_TANK_FULL_CM));
     if (nutrPct < 0) nutrPct = 0;
     if (nutrPct > 100) nutrPct = 100;
+    hmiNode.writeSingleRegister(0x0000, (uint16_t)nutrPct);
+    delay(HMI_WRITE_DELAY_MS);
     hmiNode.writeSingleRegister(0x0005, nutrPct);
     delay(HMI_WRITE_DELAY_MS);
     int airPct = (int)((WATER_TANK_EMPTY_CM - us2) * 100 / (WATER_TANK_EMPTY_CM - WATER_TANK_FULL_CM));
     if (airPct < 0) airPct = 0;
     if (airPct > 100) airPct = 100;
+    hmiNode.writeSingleRegister(0x0001, (uint16_t)airPct);
+    delay(HMI_WRITE_DELAY_MS);
     hmiNode.writeSingleRegister(0x0006, airPct);
 }
 
@@ -415,27 +427,53 @@ bool controlRelayValve(int idx, bool open) {
 }
 
 bool controlPumpRelay(bool on) {
-  bool ok = writeCoilWithRetry(PUMP_RELAY_COIL, on);
-  vTaskDelay(pdMS_TO_TICKS(PUMP_VERIFY_DELAY_MS));
-  if (autoMode) {
-    uint8_t res = relayNode.readCoils(PUMP_RELAY_COIL, 1);
-    if (res == relayNode.ku8MBSuccess) {
-      uint16_t word = relayNode.getResponseBuffer(0);
-      bool bit = word & 0x01;
-      if ((on && !bit) || (!on && bit)) {
-        LOG_WARN("Pump relay verify mismatch coil:%u", PUMP_RELAY_COIL);
-      }
-    } else {
-      LOG_WARN("Pump relay read failure code:%u", res);
+  uint8_t lastErr = 0xFF;
+  for (int attempt = 0; attempt < MODBUS_WRITE_RETRY_COUNT; attempt++) {
+    esp_task_wdt_reset();
+    uint8_t r = vfdNode.writeSingleRegister(VFD_REG_CONTROL_COMMAND, on ? VFD_CMD_RUN_FWD : VFD_CMD_STOP);
+    esp_task_wdt_reset();
+    if (r == vfdNode.ku8MBSuccess) {
+      pumpState = on;
+      hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, on ? 1 : 0);
+      return true;
     }
+    lastErr = r;
+    vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_DELAY_MS));
   }
-  if (!ok) {
-    LOG_ERROR("Pump relay write failure coil:%u state:%u", PUMP_RELAY_COIL, on?1:0);
-    return false;
+  LOG_ERROR("VFD command failure reg:%u cmd:0x%04X code:%u", VFD_REG_CONTROL_COMMAND, on ? VFD_CMD_RUN_FWD : VFD_CMD_STOP, lastErr);
+  return false;
+}
+
+static bool vfdSetFrequencyHz(float hz) {
+  float safeHz = hz;
+  if (safeHz < 0.0f) safeHz = 0.0f;
+  if (safeHz > VFD_MAX_ALLOWED_HZ) safeHz = VFD_MAX_ALLOWED_HZ;
+
+  float pct = (safeHz / VFD_MAX_ALLOWED_HZ) * 100.0f;
+  int32_t rawPct = (int32_t)lroundf(pct * 100.0f);
+  if (rawPct < 0) rawPct = 0;
+  if (rawPct > 10000) rawPct = 10000;
+
+  uint8_t lastErr = 0xFF;
+  for (int attempt = 0; attempt < MODBUS_WRITE_RETRY_COUNT; attempt++) {
+    esp_task_wdt_reset();
+    uint8_t r = vfdNode.writeSingleRegister(VFD_REG_COMM_SET_FREQUENCY, (uint16_t)rawPct);
+    esp_task_wdt_reset();
+    if (r == vfdNode.ku8MBSuccess) return true;
+    lastErr = r;
+    vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_DELAY_MS));
   }
-  pumpState = on;
-  hmiNode.writeSingleCoil(HMI_LAMP_ADDR + PUMP_LAMP_INDEX, on ? 1 : 0);
-  return true;
+  LOG_ERROR("VFD set frequency failure reg:%u hz:%.2f code:%u", VFD_REG_COMM_SET_FREQUENCY, safeHz, lastErr);
+  return false;
+}
+
+static bool vfdIsRunning() {
+  esp_task_wdt_reset();
+  uint8_t res = vfdNode.readHoldingRegisters(VFD_REG_RUN_STATUS, 1);
+  esp_task_wdt_reset();
+  if (res != vfdNode.ku8MBSuccess) return false;
+  uint16_t runStatus = vfdNode.getResponseBuffer(0);
+  return (runStatus & 0x0001) != 0;
 }
 
 // Function to read EC sensor with error handling
@@ -553,7 +591,7 @@ void publishSensorData() {
 }
 
 void publishValveStatus() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
   doc["valve1"] = valveState[0] ? "open" : "close";
   doc["valve2"] = valveState[1] ? "open" : "close";
   doc["valve3"] = valveState[2] ? "open" : "close";
@@ -561,7 +599,8 @@ void publishValveStatus() {
   doc["valve5"] = valveState[4] ? "open" : "close";
   doc["pump"] = pumpState ? "on" : "off";
   doc["mode"] = autoMode ? "auto" : "manual";
-  char buffer[256];
+  doc["vfdHz"] = vfdFrequencyHz;
+  char buffer[320];
   serializeJson(doc, buffer);
   if (mqtt.connected()) mqtt.publish(topic_status, buffer);
   
@@ -729,6 +768,38 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       LOG_INFO("Received mode command: %s -> HMI LB6 set %d", m.c_str(), wantAuto?1:0);
       return;
     }
+    if (doc.containsKey("vfdHz") || doc.containsKey("vfd_hz") || doc.containsKey("vfdFrequency") || doc.containsKey("frequency") || doc.containsKey("pumpFrequency")) {
+      if (autoMode) {
+        LOG_WARN("Ignoring VFD frequency command in AUTO mode");
+        return;
+      }
+      float hz = 0.0f;
+      if (doc.containsKey("vfdHz")) hz = doc["vfdHz"].as<float>();
+      else if (doc.containsKey("vfd_hz")) hz = doc["vfd_hz"].as<float>();
+      else if (doc.containsKey("vfdFrequency")) hz = doc["vfdFrequency"].as<float>();
+      else if (doc.containsKey("pumpFrequency")) hz = doc["pumpFrequency"].as<float>();
+      else hz = doc["frequency"].as<float>();
+
+      if (!isfinite(hz)) {
+        LOG_WARN("Invalid VFD frequency value");
+        return;
+      }
+      if (hz < 0.0f) hz = 0.0f;
+      if (hz > VFD_MAX_ALLOWED_HZ) hz = VFD_MAX_ALLOWED_HZ;
+
+      float roundedHz = roundf(hz);
+      uint16_t raw = 0;
+      if (fabsf(hz - roundedHz) < 0.001f && roundedHz <= VFD_MAX_ALLOWED_HZ) raw = (uint16_t)roundedHz;
+      else raw = (uint16_t)roundf(hz * 100.0f);
+
+      uint8_t wr = hmiNode.writeSingleRegister(10, raw);
+      if (wr == hmiNode.ku8MBSuccess) {
+        LOG_INFO("Web VFD frequency request -> HMI LW10: raw=%u hz=%.2f", raw, hz);
+      } else {
+        LOG_ERROR("Web VFD frequency write failure code:%u raw:%u", wr, raw);
+      }
+      return;
+    }
     if (doc.containsKey("valve") && doc.containsKey("action")) {
       int idx = doc["valve"].as<int>() - 1;
       bool open = strcmp(doc["action"], "open") == 0;
@@ -849,6 +920,7 @@ void TaskModbus(void* pv) {
   ecNode.begin(EC_ID, rs485);
   us1Node.begin(US1_ID, rs485);
   us2Node.begin(US2_ID, rs485);
+  vfdNode.begin(VFD_ID, rs485);
   
   // Initialize pressure sensor ADC pin
   pinMode(PRESSURE_SENSOR_PIN, INPUT);
@@ -874,7 +946,7 @@ void TaskModbus(void* pv) {
   for (int i = 0; i < VALVE_COUNT; i++) {
     controlRelayValve(i, false);
   }
-  // Ensure pump relay (coil 11) is OFF at startup
+  // Ensure pump is OFF at startup
   controlPumpRelay(false);
   publishValveStatus();
   LOG_INFO("Startup reset: all valves OFF, HMI buttons and lamps cleared");
@@ -1059,8 +1131,14 @@ void TaskModbus(void* pv) {
     // Log successful sensor readings periodically
     static unsigned long lastSensorLog = 0;
     if (!currentIrrigation.isActive && millis() - lastSensorLog >= 10000) {
-      LOG_INFO("Sensor readings - Flow:%.2f EC:%.0f US1:%u US2:%u Pressure:%.2f",
-               waterFlow, ec, us1, us2, pressure);
+      int nutrPct = (int)((NUTRI_TANK_EMPTY_CM - us1) * 100 / (NUTRI_TANK_EMPTY_CM - NUTRI_TANK_FULL_CM));
+      if (nutrPct < 0) nutrPct = 0;
+      if (nutrPct > 100) nutrPct = 100;
+      int airPct = (int)((WATER_TANK_EMPTY_CM - us2) * 100 / (WATER_TANK_EMPTY_CM - WATER_TANK_FULL_CM));
+      if (airPct < 0) airPct = 0;
+      if (airPct > 100) airPct = 100;
+      LOG_INFO("Sensor readings - Flow:%.2f L/min EC:%.0f uS/cm Pressure:%.2f Bar Nutri:%d%% Air:%d%%",
+               waterFlow, ec, pressure, nutrPct, airPct);
       lastSensorLog = millis();
     }
 
@@ -1110,12 +1188,7 @@ void TaskModbus(void* pv) {
         }
         static unsigned long lastPumpEnsure = 0;
         if (currentIrrigation.activationReady && millis() - lastPumpEnsure >= 1000) {
-          uint8_t pr = relayNode.readCoils(PUMP_RELAY_COIL, 1);
-          bool pon = false;
-          if (pr == relayNode.ku8MBSuccess) {
-            uint16_t w = relayNode.getResponseBuffer(0);
-            pon = w & 0x01;
-          }
+          bool pon = vfdIsRunning();
           if (!pon) {
             bool sc = controlPumpRelay(true);
             if (!sc) {
@@ -1264,6 +1337,32 @@ void TaskModbus(void* pv) {
       }
     } else {
       LOG_WARN("HMI button read failure - error code: %u", res);
+    }
+
+    unsigned long nowMs = millis();
+    unsigned long pollMs = autoMode ? 500 : 200;
+    if (nowMs - lastHmiVfdFreqPoll >= pollMs) {
+      lastHmiVfdFreqPoll = nowMs;
+      uint8_t fr = hmiNode.readHoldingRegisters(10, 1);
+      if (fr == hmiNode.ku8MBSuccess) {
+        uint16_t raw = hmiNode.getResponseBuffer(0);
+        if (raw != lastHmiVfdFreqRaw) {
+          lastHmiVfdFreqRaw = raw;
+          float hz = 0.0f;
+          if (raw <= (uint16_t)VFD_MAX_ALLOWED_HZ) hz = (float)raw;
+          else hz = raw / 100.0f;
+          if (hz < 0.0f) hz = 0.0f;
+          if (hz > VFD_MAX_ALLOWED_HZ) hz = VFD_MAX_ALLOWED_HZ;
+          vfdFrequencyHz = hz;
+          bool ok = vfdSetFrequencyHz(hz);
+          publishValveStatus();
+          if (ok) {
+            LOG_INFO("VFD frequency set from HMI LW10: raw=%u hz=%.2f", raw, hz);
+          } else {
+            LOG_ERROR("VFD frequency set failed from HMI LW10: raw=%u hz=%.2f", raw, hz);
+          }
+        }
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(autoMode ? HMI_POLL_INTERVAL_AUTO_MS : HMI_POLL_INTERVAL_MANUAL_MS));
