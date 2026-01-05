@@ -1,0 +1,21 @@
+Nama Pengujian;Skenario;Hasil yang Diharapkan
+Start Sistem;Alat dinyalakan dari kondisi mati;Sistem menyala, tidak sering restart, pesan awal muncul di serial, semua fungsi utama siap digunakan
+Koneksi WiFi;Alat dinyalakan di ruangan yang ada jaringan WiFi;Alat berhasil terhubung ke WiFi, mendapat IP, dan tetap terhubung selama pengujian
+Koneksi ke Server;Setelah alat terhubung ke WiFi, server MQTT aktif;Alat berhasil terhubung ke server dan tetap terhubung, jika terputus akan mencoba menyambung lagi sampai berhasil
+Pengiriman Data Sensor;Alat berjalan dengan semua sensor terpasang;Data sensor (aliran air, EC, ketinggian air, tekanan) terkirim berkala ke server dan nilainya berubah sesuai kondisi nyata
+Tampilan Data di Panel;Ketinggian air, tekanan, dan kondisi lain diubah secara fisik;Angka yang tampil di panel lokal ikut berubah dan sesuai dengan kondisi fisik dan data di server
+Pembacaan Sensor Aliran Air;Debit air diatur ke beberapa nilai (rendah, sedang, tinggi);Nilai aliran air yang terbaca meningkat saat debit ditambah dan menurun saat debit dikurangi, tidak selalu nol
+Pembacaan Sensor EC;Larutan dengan kadar berbeda diberikan ke sensor;Nilai EC berubah mengikuti perubahan larutan, tidak menunjukkan nilai yang sama terus-menerus jika kondisi berubah
+Pembacaan Sensor Ketinggian;Ketinggian air di tangki dinaikkan dan diturunkan;Nilai jarak dan persentase isi tangki berubah sesuai: saat air naik persentase bertambah, saat air turun persentase berkurang
+Pembacaan Sensor Tekanan;Tekanan pada pipa atau tangki diubah (ditambah dan dikurangi);Nilai tekanan yang terbaca meningkat saat tekanan naik dan menurun saat tekanan turun, tidak loncat-loncat tidak wajar
+Kontrol Valve Manual;Mode manual aktif, tombol valve di panel ditekan ON dan OFF;Saat tombol ON valve membuka dan saat OFF valve menutup, bunyi relay terdengar, indikator di panel ikut berubah
+Kontrol Pompa Manual;Mode manual aktif, tombol pompa di panel ditekan ON dan OFF;Pompa menyala saat tombol ON dan mati saat OFF, indikator pompa di panel dan status di server sesuai kondisi sebenarnya
+Kontrol Valve Jarak Jauh;Perintah buka atau tutup valve dikirim dari aplikasi atau web;Valve yang sesuai membuka atau menutup dalam waktu singkat, status di panel dan data di server ikut berubah mengikuti perintah
+Kontrol Pompa Jarak Jauh;Perintah hidup atau matikan pompa dikirim dari aplikasi atau web;Pompa menyala atau mati sesuai perintah, dan status di panel dan data di server sama dengan kondisi pompa di lapangan
+Pergantian Mode Otomatis atau Manual;Mode diubah dari manual ke otomatis dan sebaliknya;Saat mode diganti, sistem kembali ke kondisi aman dengan mematikan valve dan pompa, kemudian mode baru berjalan sesuai fungsinya
+Penyimpanan Pengaturan;Pengaturan jadwal dan konfigurasi diubah, lalu alat dimatikan dan dinyalakan kembali;Setelah menyala lagi, pengaturan jadwal dan konfigurasi tetap tersimpan dan digunakan oleh sistem tanpa perlu diatur ulang
+Eksekusi Jadwal Otomatis;Jadwal diset pada jam tertentu dan mode otomatis diaktifkan;Pada waktu yang ditentukan, sistem otomatis menyalakan pompa dan valve yang sesuai tanpa perintah manual
+Penghentian Berdasarkan Volume;Jadwal dibuat dengan target volume tertentu;Setelah jumlah air yang diinginkan tercapai, sistem otomatis mematikan pompa dan menutup valve meskipun waktunya belum habis
+Deteksi Tidak Ada Aliran;Irigasi berjalan, lalu aliran air tiba-tiba dihentikan seperti pompa rusak atau valve tertutup;Sistem mendeteksi tidak ada aliran dalam waktu tertentu, lalu otomatis menghentikan proses dan mematikan pompa dan valve untuk keamanan
+Sinkronisasi Waktu;Alat terhubung ke internet dalam mode otomatis;Waktu internal alat menyesuaikan dengan waktu resmi sehingga jadwal irigasi berjalan pada jam yang tepat
+Ketahanan Sistem;Alat dijalankan terus menerus dalam waktu lama, misalnya 24 jam;Sistem tetap stabil, tidak sering hang atau restart, dan semua fungsi seperti sensor, kontrol, dan komunikasi tetap berjalan normal

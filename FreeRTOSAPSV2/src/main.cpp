@@ -32,6 +32,7 @@ const char* topic_control = "silagung/control";
 const char* topic_control_feedback = "silagung/control/feedback";
 const char* topic_irrigation_config = "silagung/irrigation/config";
 const char* topic_irrigation_ack = "silagung/irrigation/ack";
+const char* topic_irrigation_log = "silagung/irrigation/log";
 
 // Hardware Pins
 #define RS485_RX 17
@@ -192,8 +193,8 @@ const unsigned long NTP_SYNC_INTERVAL = 60000;
 unsigned long lastTimeLog = 0;
 const unsigned long TIME_LOG_INTERVAL = 5000;
 const float MIN_FLOW_THRESHOLD = 0.10f;
-const unsigned int NO_FLOW_STALL_SECONDS = 30; //berapa attemp ini maksudnya
-const unsigned int NO_PROGRESS_STALL_SECONDS = 30;
+const unsigned int NO_FLOW_STALL_SECONDS = 5; //berapa attemp ini maksudnya
+const unsigned int NO_PROGRESS_STALL_SECONDS = 5;
 const float EC_CONTROL_HYSTERESIS_US = 50.0f;
 const unsigned long EC_CONTROL_INTERVAL_MS = 1500;
 const unsigned long EC_CONTROL_MIN_SWITCH_MS = 3000;
@@ -342,6 +343,40 @@ static void publishScheduleFeedback(int valveIdx, const char* action, const char
   serializeJson(doc, buffer);
   if (mqtt.connected()) {
     mqtt.publish(topic_control_feedback, buffer);
+  }
+}
+
+static void publishIrrigationLog(const ActiveIrrigationState& state,
+                                 const IrrigationConfigItem* config,
+                                 const IrrigationScheduleItem* sched,
+                                 const char* resultStatus,
+                                 float waterDelivered) {
+  StaticJsonDocument<256> doc;
+  doc["landName"] = state.landName;
+  if (sched) {
+    doc["scheduleTime"] = sched->time;
+  }
+  doc["irrigationType"] = state.irrigationType;
+  float targetEcVal = state.targetEC;
+  float waterPlanVal = state.waterNeeded;
+  if (config) {
+    targetEcVal = config->targetEC;
+    waterPlanVal = config->waterPerSchedule;
+  }
+  doc["targetEC"] = targetEcVal;
+  doc["waterPlan"] = waterPlanVal;
+  doc["waterDelivered"] = waterDelivered;
+  doc["result"] = resultStatus;
+  if (rtcInitialized) {
+    DateTime now = rtc.now();
+    char hhmmss[9];
+    sprintf(hhmmss, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    doc["finishTime"] = hhmmss;
+  }
+  char buffer[256];
+  serializeJson(doc, buffer);
+  if (mqtt.connected()) {
+    mqtt.publish(topic_irrigation_log, buffer);
   }
 }
 
@@ -1606,13 +1641,23 @@ void TaskModbus(void* pv) {
           setPumpLamp(false);
           stopAllValvesAndResetHmiBatch();
           vTaskDelay(pdMS_TO_TICKS(irrigationStepDelayMs()));
+          float delivered = currentIrrigation.waterDelivered;
+          int ci = currentIrrigation.configIndex;
+          int si = currentIrrigation.scheduleIndex;
+          IrrigationConfigItem* cfg = nullptr;
+          IrrigationScheduleItem* sched = nullptr;
+          if (ci >= 0 && ci < totalConfigs && configs[ci].isValid) {
+            cfg = &configs[ci];
+            if (si >= 0 && si < configs[ci].scheduleCount) {
+              sched = &configs[ci].schedules[si];
+            }
+          }
+          publishIrrigationLog(currentIrrigation, cfg, sched, "fail_flow", delivered);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
           publishValveStatus();
           publishScheduleFeedback(currentIrrigation.landRelay, "stop", "fail_flow", currentIrrigation.configId, "schedule");
-          int ci = currentIrrigation.configIndex;
-          int si = currentIrrigation.scheduleIndex;
           if (ci >= 0 && si + 1 < configs[ci].scheduleCount) {
             IrrigationJob next; next.configIndex = ci; next.scheduleIndex = si + 1;
             xQueueSend(xIrrigationQueue, &next, 0);
@@ -1627,6 +1672,18 @@ void TaskModbus(void* pv) {
           setPumpLamp(false);
           stopAllValvesAndResetHmiBatch();
           vTaskDelay(pdMS_TO_TICKS(irrigationStepDelayMs()));
+          float delivered = currentIrrigation.waterDelivered;
+          int ci = currentIrrigation.configIndex;
+          int si = currentIrrigation.scheduleIndex;
+          IrrigationConfigItem* cfg = nullptr;
+          IrrigationScheduleItem* sched = nullptr;
+          if (ci >= 0 && ci < totalConfigs && configs[ci].isValid) {
+            cfg = &configs[ci];
+            if (si >= 0 && si < configs[ci].scheduleCount) {
+              sched = &configs[ci].schedules[si];
+            }
+          }
+          publishIrrigationLog(currentIrrigation, cfg, sched, "success", delivered);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
@@ -1639,6 +1696,18 @@ void TaskModbus(void* pv) {
           setPumpLamp(false);
           stopAllValvesAndResetHmiBatch();
           vTaskDelay(pdMS_TO_TICKS(irrigationStepDelayMs()));
+          float delivered = currentIrrigation.waterDelivered;
+          int ci = currentIrrigation.configIndex;
+          int si = currentIrrigation.scheduleIndex;
+          IrrigationConfigItem* cfg = nullptr;
+          IrrigationScheduleItem* sched = nullptr;
+          if (ci >= 0 && ci < totalConfigs && configs[ci].isValid) {
+            cfg = &configs[ci];
+            if (si >= 0 && si < configs[ci].scheduleCount) {
+              sched = &configs[ci].schedules[si];
+            }
+          }
+          publishIrrigationLog(currentIrrigation, cfg, sched, "timeout", delivered);
           currentIrrigation.isActive = false;
           currentIrrigation.activationReady = false;
           currentIrrigation.waterDelivered = 0;
