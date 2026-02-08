@@ -76,9 +76,9 @@ const char* topic_irrigation_log = "silagung/irrigation/log";
 #define MODE_SWITCH_INDEX 6
 #define WATER_SUPPLY_VALVE_IDX 0
 #define NUTRI_SUPPLY_VALVE_IDX 1
-#define NUTRI_TANK_EMPTY_CM 120
+#define NUTRI_TANK_EMPTY_CM 80 //test
 #define NUTRI_TANK_FULL_CM 25
-#define WATER_TANK_EMPTY_CM 120
+#define WATER_TANK_EMPTY_CM 80 //test
 #define WATER_TANK_FULL_CM 25
 
 // Pressure Sensor Configuration (4-20mA)
@@ -1002,8 +1002,6 @@ void publishSensorData() {
   StaticJsonDocument<256> doc;
   doc["waterFlow"] = waterFlow;
   doc["ec"] = ec;
-  doc["ultrasonic1"] = us1;
-  doc["ultrasonic2"] = us2;
   doc["pressure"] = pressure;
   int nutrPct = (int)((NUTRI_TANK_EMPTY_CM - us1) * 100 / (NUTRI_TANK_EMPTY_CM - NUTRI_TANK_FULL_CM));
   if (nutrPct < 0) nutrPct = 0;
