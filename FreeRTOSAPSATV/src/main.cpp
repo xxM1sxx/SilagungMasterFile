@@ -20,6 +20,8 @@ static inline void lockModbus();
 static inline void unlockModbus();
 static bool writeHmiCoilWithRetry(uint16_t coil, bool state);
 static bool writeHmiRegisterWithRetry(uint16_t reg, uint16_t value);
+static bool vfdSetFrequencyHz(float hz);
+static bool vfdReadIsRunning(bool& running);
 
 // MQTT Config
 const char* mqtt_broker = "72350f0b16bb43f2af1b3b453ac66c34.s1.eu.hivemq.cloud";
@@ -39,6 +41,7 @@ const char* topic_irrigation_log = "silagung/irrigation/log";
 #define RS485_TX 18
 #define RS485_DE -1  // Jika pakai DE/RE, ganti dengan pin nyata
 #define BAUD_RATE 9600
+static const int RS485_CONFIG = SERIAL_8N1;
 
 // Logging Config
 #define LOG_ENABLED 1
@@ -82,7 +85,7 @@ const char* topic_irrigation_log = "silagung/irrigation/log";
 #define WATER_SUPPLY_VALVE_IDX 0
 #define NUTRI_SUPPLY_VALVE_IDX 1
 #define NUTRI_TANK_EMPTY_CM 105 //test
-#define NUTRI_TANK_FULL_CM 80
+#define NUTRI_TANK_FULL_CM 25
 #define WATER_TANK_EMPTY_CM 105 //test
 #define WATER_TANK_FULL_CM 25
 
@@ -94,12 +97,23 @@ const char* topic_irrigation_log = "silagung/irrigation/log";
 #define MAX_CURRENT 20.0          // Maximum current for 4-20mA sensor
 #define MAX_PRESSURE 10.0         // Maximum pressure in Bar (0-10 Bar)
 
+static constexpr uint16_t FLOW_REG_FLOW_RATE = 0x0000;
+static constexpr uint16_t FLOW_REG_UNIT = 1437;
+static constexpr unsigned long FLOW_UNIT_REFRESH_MS = 10000;
+
 static constexpr float VFD_MAX_ALLOWED_HZ = 50.0f;
-static constexpr uint16_t VFD_REG_CONTROL_COMMAND = 0x2000;
-static constexpr uint16_t VFD_REG_COMM_SET_FREQUENCY = 0x2001;
-static constexpr uint16_t VFD_REG_RUN_STATUS = 0x2101;
-static constexpr uint16_t VFD_CMD_STOP = 0x0001;
-static constexpr uint16_t VFD_CMD_RUN_FWD = 0x0012;
+static constexpr uint16_t VFD_REG_CONTROL_COMMAND = 0x31D9;
+static constexpr uint16_t VFD_REG_COMM_SET_FREQUENCY = 0x31DA;
+static constexpr uint16_t VFD_REG_RUN_STATUS = 0x31C5;
+static constexpr uint16_t VFD_CMD_STOP = 0x0000;
+static constexpr uint16_t VFD_CMD_SHUTDOWN = 0x0006;
+static constexpr uint16_t VFD_CMD_SWITCH_ON = 0x0007;
+static constexpr uint16_t VFD_CMD_RUN_FWD = 0x000F;
+static constexpr uint16_t VFD_CMD_RUN_REV = 0x080F;
+static constexpr uint16_t VFD_CMD_FAULT_RESET = 0x0080;
+static constexpr int VFD_CMD_RETRY_COUNT = 3;
+static constexpr unsigned long VFD_CMD_RETRY_DELAY_MS = 20;
+static constexpr unsigned long VFD_SEQ_DELAY_MS = 25;
 
 // Utility function to convert Modbus registers to float
 float registersToFloat(uint16_t r1, uint16_t r2) {
@@ -107,6 +121,29 @@ float registersToFloat(uint16_t r1, uint16_t r2) {
   float f;
   memcpy(&f, &combined, 4);
   return f;
+}
+
+float decodeReal4CDAB(uint16_t w0, uint16_t w1) {
+  uint8_t a = (uint8_t)(w0 >> 8);
+  uint8_t b = (uint8_t)(w0 & 0xFF);
+  uint8_t c = (uint8_t)(w1 >> 8);
+  uint8_t d = (uint8_t)(w1 & 0xFF);
+  uint32_t raw = ((uint32_t)c << 24) | ((uint32_t)d << 16) | ((uint32_t)a << 8) | (uint32_t)b;
+  float val;
+  memcpy(&val, &raw, sizeof(val));
+  return val;
+}
+
+float convertFlowToLpm(float value, uint16_t unitCode) {
+  if (unitCode == 0) return value * 1000.0f * 60.0f;
+  if (unitCode == 1) return value * 1000.0f;
+  if (unitCode == 2) return value * 1000.0f / 60.0f;
+  if (unitCode == 3) return value * 1000.0f / 1440.0f;
+  if (unitCode == 4) return value * 60.0f;
+  if (unitCode == 5) return value;
+  if (unitCode == 6) return value / 60.0f;
+  if (unitCode == 7) return value / 1440.0f;
+  return value;
 }
 
 float regsToFloatHL(uint16_t high, uint16_t low) {
@@ -170,6 +207,12 @@ bool autoMode = false;
 uint16_t lastHmiVfdFreqRaw = 0xFFFF;
 unsigned long lastHmiVfdFreqPoll = 0;
 float vfdFrequencyHz = 0.0f;
+float vfdFrequencyScale = 3.0f;
+float vfdMaxFrequencyHz = VFD_MAX_ALLOWED_HZ;
+unsigned long lastVfdKeepAliveMs = 0;
+static constexpr unsigned long VFD_KEEPALIVE_INTERVAL_MS = 10000;
+uint16_t flowUnitCode = 2;
+unsigned long lastFlowUnitReadMs = 0;
 
 // Logging state tracking
 bool lastDisplayEmpty = false;
@@ -269,7 +312,6 @@ struct IrrigationConfigItem {
   String phaseName;
   float waterRequirement;
   float waterPerSchedule;
-  float targetEC;
   String irrigationType; // "air" | "air_nutrisi"
   IrrigationScheduleItem schedules[10];
   int scheduleCount;
@@ -291,7 +333,6 @@ struct ActiveIrrigationState {
   String startTime;
   float waterNeeded;
   float waterDelivered;
-  float targetEC;
   String irrigationType;
   bool isActive;
   bool activationReady;
@@ -366,13 +407,10 @@ static void publishIrrigationLog(const ActiveIrrigationState& state,
     doc["scheduleTime"] = sched->time;
   }
   doc["irrigationType"] = state.irrigationType;
-  float targetEcVal = state.targetEC;
   float waterPlanVal = state.waterNeeded;
   if (config) {
-    targetEcVal = config->targetEC;
     waterPlanVal = config->waterPerSchedule;
   }
-  doc["targetEC"] = targetEcVal;
   doc["waterPlan"] = waterPlanVal;
   doc["waterDelivered"] = waterDelivered;
   doc["result"] = resultStatus;
@@ -438,11 +476,31 @@ bool readUltrasonicSensor(ModbusMaster& node, uint16_t& distance, const char* se
 
 // Function to read water flow sensor with error handling
 bool readWaterFlowSensor(ModbusMaster& node, float& flow, const char* sensorName) {
-    bool ok = readFloat32Holding(node, 0x0000, flow);
-    if (ok) {
-        consecutiveSensorErrors[0] = 0;
-        return true;
-    } else {
+    static float lastGoodFlow = 0.0f;
+    static bool hasGoodFlow = false;
+    uint16_t w0 = 0, w1 = 0;
+    uint8_t res = 0xFF;
+    bool okRead = false;
+    for (uint8_t i = 0; i < READ_RETRY; i++) {
+        esp_task_wdt_reset();
+        lockModbus();
+        unsigned long flushStart = millis();
+        while (rs485.available() && (millis() - flushStart < RS485_FLUSH_MAX_MS)) {
+            rs485.read();
+        }
+        node.clearResponseBuffer();
+        res = node.readHoldingRegisters(FLOW_REG_FLOW_RATE, 2);
+        if (res == node.ku8MBSuccess) {
+            w0 = node.getResponseBuffer(0);
+            w1 = node.getResponseBuffer(1);
+            okRead = true;
+        }
+        unlockModbus();
+        esp_task_wdt_reset();
+        if (okRead) break;
+        vTaskDelay(pdMS_TO_TICKS(modbusRetryDelayMs()));
+    }
+    if (!okRead) {
         consecutiveSensorErrors[0]++;
         if (consecutiveSensorErrors[0] >= MAX_CONSECUTIVE_ERRORS) {
             if (millis() - lastSensorFail[0] > SENSOR_FAIL_LOG_INTERVAL) {
@@ -450,9 +508,31 @@ bool readWaterFlowSensor(ModbusMaster& node, float& flow, const char* sensorName
                 lastSensorFail[0] = millis();
             }
         }
-        flow = 0.0;
+        flow = hasGoodFlow ? lastGoodFlow : 0.0f;
         return false;
     }
+    if (millis() - lastFlowUnitReadMs > FLOW_UNIT_REFRESH_MS) {
+        uint16_t unitRaw = 0;
+        uint8_t resU = 0xFF;
+        lockModbus();
+        resU = node.readHoldingRegisters(FLOW_REG_UNIT, 1);
+        if (resU == node.ku8MBSuccess) unitRaw = node.getResponseBuffer(0);
+        unlockModbus();
+        if (resU == node.ku8MBSuccess && unitRaw <= 31) {
+            flowUnitCode = unitRaw;
+            lastFlowUnitReadMs = millis();
+        }
+    }
+    float raw = decodeReal4CDAB(w0, w1);
+    if (!isfinite(raw)) {
+        flow = hasGoodFlow ? lastGoodFlow : 0.0f;
+        return false;
+    }
+    flow = convertFlowToLpm(raw, flowUnitCode);
+    lastGoodFlow = flow;
+    hasGoodFlow = true;
+    consecutiveSensorErrors[0] = 0;
+    return true;
 }
 
 // HMI Write Functions for Sensor Display
@@ -907,34 +987,72 @@ bool controlRelayValve(int idx, bool open) {
 
 bool controlPumpRelay(bool on) {
   bool ok = writeCoilWithRetry(PUMP_RELAY_COIL, on);
-  if (!ok) {
-    LOG_ERROR("Pump relay command failure coil:%u state:%u", PUMP_RELAY_COIL, on ? 1 : 0);
-    return false;
-  }
   bool actual = on;
-  bool verified = verifyRelayCoilState(PUMP_RELAY_COIL, on, actual);
-  if (!verified) {
-    LOG_ERROR("Pump relay verify mismatch coil:%u want:%u actual:%u", PUMP_RELAY_COIL, on ? 1 : 0, actual ? 1 : 0);
+  if (ok) {
+    bool readOk = readRelayCoilState(PUMP_RELAY_COIL, actual);
+    if (readOk && actual != on) {
+      writeCoilWithRetry(PUMP_RELAY_COIL, on);
+      vTaskDelay(pdMS_TO_TICKS(relayVerifyDelayMs()));
+      readRelayCoilState(PUMP_RELAY_COIL, actual);
+    }
+    pumpState = actual;
+  } else {
+    pumpState = on;
   }
-  pumpState = actual;
-  setPumpLamp(actual);
-  return verified;
+  setPumpLamp(pumpState);
+  return ok;
 }
 
 static bool vfdSetFrequencyHz(float hz) {
   float safeHz = hz;
   if (safeHz < 0.0f) safeHz = 0.0f;
-  if (safeHz > VFD_MAX_ALLOWED_HZ) safeHz = VFD_MAX_ALLOWED_HZ;
+  float maxInputHz = VFD_MAX_ALLOWED_HZ;
+  if (vfdFrequencyScale < 0.01f) vfdFrequencyScale = 0.01f;
+  float maxByScale = 4000.0f / (10.0f * vfdFrequencyScale);
+  if (maxByScale < maxInputHz) maxInputHz = maxByScale;
+  if (safeHz > maxInputHz) safeHz = maxInputHz;
+  if (vfdMaxFrequencyHz < 0.01f) vfdMaxFrequencyHz = 0.01f;
+  if (vfdMaxFrequencyHz > VFD_MAX_ALLOWED_HZ) vfdMaxFrequencyHz = VFD_MAX_ALLOWED_HZ;
+  if (safeHz > vfdMaxFrequencyHz) safeHz = vfdMaxFrequencyHz;
   vfdFrequencyHz = safeHz;
-  return true;
+  int32_t raw = (int32_t)lroundf(safeHz * vfdFrequencyScale * 10.0f);
+  if (raw < 0) raw = 0;
+  if (raw > 4000) raw = 4000;
+  for (int attempt = 0; attempt < modbusWriteRetryCount(); attempt++) {
+    esp_task_wdt_reset();
+    lockModbus();
+    uint8_t r = vfdNode.writeSingleRegister(VFD_REG_COMM_SET_FREQUENCY, (uint16_t)raw);
+    unlockModbus();
+    esp_task_wdt_reset();
+    if (r == vfdNode.ku8MBSuccess) {
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(modbusRetryDelayMs()));
+  }
+  return false;
 }
 
 static bool vfdIsRunning() {
+  bool running = false;
+  if (vfdReadIsRunning(running)) return running;
   return pumpState;
 }
 
 static bool vfdReadIsRunning(bool& running) {
-  running = pumpState;
+  uint8_t res = 0xFF;
+  uint16_t eta = 0;
+  esp_task_wdt_reset();
+  lockModbus();
+  res = vfdNode.readHoldingRegisters(VFD_REG_RUN_STATUS, 1);
+  if (res == vfdNode.ku8MBSuccess) {
+    eta = vfdNode.getResponseBuffer(0);
+  }
+  unlockModbus();
+  esp_task_wdt_reset();
+  if (res != vfdNode.ku8MBSuccess) return false;
+  bool operationEnabled = (eta >> 2) & 0x01;
+  bool fault = (eta >> 3) & 0x01;
+  running = operationEnabled && !fault;
   return true;
 }
 
@@ -1129,7 +1247,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         item.phaseName = String(config["phaseName"].as<const char*>());
         item.waterRequirement = config["waterRequirement"] | 0.0;
         item.waterPerSchedule = config["waterPerSchedule"] | 0.0;
-        item.targetEC = config["targetEC"] | 0.0;
         item.irrigationType = String(config["irrigationType"].as<const char*>());
         item.irrigationType.trim();
         JsonArray schedules = config["schedules"].as<JsonArray>();
@@ -1165,7 +1282,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         preferences.putString((prefix + "phaseName").c_str(), configs[i].phaseName);
         preferences.putFloat((prefix + "waterReq").c_str(), configs[i].waterRequirement);
         preferences.putFloat((prefix + "wps").c_str(), configs[i].waterPerSchedule);
-        preferences.putFloat((prefix + "targetEC").c_str(), configs[i].targetEC);
         preferences.putString((prefix + "irrigType").c_str(), configs[i].irrigationType);
         preferences.putInt((prefix + "schedCount").c_str(), configs[i].scheduleCount);
         preferences.putBool((prefix + "valid").c_str(), configs[i].isValid);
@@ -1184,7 +1300,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       item.phaseName = String(cfgDoc["phaseName"].as<const char*>());
       item.waterRequirement = cfgDoc["waterRequirement"] | 0.0;
       item.waterPerSchedule = cfgDoc["waterPerSchedule"] | 0.0;
-      item.targetEC = cfgDoc["targetEC"] | 0.0;
       item.irrigationType = String(cfgDoc["irrigationType"].as<const char*>());
       item.irrigationType.trim();
       JsonArray schedules = cfgDoc["schedules"].as<JsonArray>();
@@ -1212,7 +1327,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         preferences.putString((prefix + "phaseName").c_str(), item.phaseName);
         preferences.putFloat((prefix + "waterReq").c_str(), item.waterRequirement);
         preferences.putFloat((prefix + "wps").c_str(), item.waterPerSchedule);
-        preferences.putFloat((prefix + "targetEC").c_str(), item.targetEC);
         preferences.putString((prefix + "irrigType").c_str(), item.irrigationType);
         preferences.putInt((prefix + "schedCount").c_str(), item.scheduleCount);
         preferences.putBool((prefix + "valid").c_str(), item.isValid);
@@ -1403,7 +1517,7 @@ void TaskMQTT(void* pv) {
 void TaskModbus(void* pv) {
   LOG_INFO("Starting Modbus Task");
   esp_task_wdt_add(NULL);
-  rs485.begin(BAUD_RATE, SERIAL_8N1, RS485_RX, RS485_TX);
+  rs485.begin(BAUD_RATE, RS485_CONFIG, RS485_RX, RS485_TX);
   hmiNode.begin(HMI_ID, rs485);
   relayNode.begin(RELAY_ID, rs485);
   flowNode.begin(FLOW_ID, rs485);
@@ -1570,10 +1684,9 @@ void TaskModbus(void* pv) {
         lastFlowAccum = millis();
         bool isAirOnly = currentIrrigation.irrigationType.equalsIgnoreCase("air");
         bool isAirNutrisi = currentIrrigation.irrigationType.equalsIgnoreCase("air_nutrisi") || currentIrrigation.irrigationType.equalsIgnoreCase("air+nutrisi");
-        bool ecControlEnabled = isAirNutrisi && currentIrrigation.targetEC > 0.1f;
         int landIdx = currentIrrigation.landRelay - 1;
         bool configReady = pumpState && valveState[WATER_SUPPLY_VALVE_IDX] && valveState[landIdx];
-        if (!ecControlEnabled && isAirNutrisi) configReady = configReady && valveState[NUTRI_SUPPLY_VALVE_IDX];
+        if (isAirNutrisi) configReady = configReady && valveState[NUTRI_SUPPLY_VALVE_IDX];
         if ((millis() - currentIrrigation.startMillis) < ACTIVATION_SETTLE_MS) configReady = false;
         unsigned long elapsedSec = (millis() - currentIrrigation.startMillis) / 1000;
         int etaSec = -1;
@@ -1627,69 +1740,6 @@ void TaskModbus(void* pv) {
             setPumpLamp(true);
           }
           lastPumpEnsure = millis();
-        }
-
-        static unsigned long lastEcControlMs = 0;
-        static unsigned long lastNutrValveChangeMs = 0;
-        static unsigned long lastNutrRelaysOffMs = 0;
-        static unsigned long lastNutrRedriveMs = 0;
-        static unsigned long lastEcCtrlIrrStartMs = 0;
-        static uint8_t nutrRedriveCount = 0;
-        if (currentIrrigation.activationReady && ecControlEnabled && configReady) {
-          unsigned long now = millis();
-          if (now - lastEcControlMs >= EC_CONTROL_INTERVAL_MS) {
-            lastEcControlMs = now;
-            float target = currentIrrigation.targetEC;
-            if (ec > 1.0f && target > 0.1f) {
-              if (lastEcCtrlIrrStartMs != currentIrrigation.startMillis) {
-                lastEcCtrlIrrStartMs = currentIrrigation.startMillis;
-                nutrRedriveCount = 0;
-                lastNutrRedriveMs = 0;
-              }
-
-              bool currNutr = valveState[NUTRI_SUPPLY_VALVE_IDX];
-              bool wantNutr = currNutr;
-              float low = target - EC_CONTROL_HYSTERESIS_US;
-              float high = target + EC_CONTROL_HYSTERESIS_US;
-              if (ec < low) wantNutr = true;
-              else if (ec > high) wantNutr = false;
-              else {
-                nutrRedriveCount = 0;
-                if (now - lastNutrRelaysOffMs >= 1500) {
-                  bool offOk = setNutrisiRelaysOff();
-                  if (offOk) lastNutrRelaysOffMs = now;
-                }
-              }
-
-              if (wantNutr != currNutr && (now - lastNutrValveChangeMs >= EC_CONTROL_MIN_SWITCH_MS)) {
-                bool ok = driveNutrisiMotorTo(wantNutr);
-                writeHmiCoilWithRetry(HMI_LAMP_ADDR + NUTRI_SUPPLY_VALVE_IDX, wantNutr);
-                writeHmiCoilWithRetry(HMI_BTN_ADDR + NUTRI_SUPPLY_VALVE_IDX, false);
-                if (ok) {
-                  xSemaphoreTake(xStateMutex, portMAX_DELAY);
-                  valveState[NUTRI_SUPPLY_VALVE_IDX] = wantNutr;
-                  xSemaphoreGive(xStateMutex);
-                  lastNutrValveChangeMs = millis();
-                  lastNutrRelaysOffMs = millis();
-                  lastNutrRedriveMs = millis();
-                  nutrRedriveCount = 0;
-                  publishValveStatus();
-                  LOG_INFO("EC control switch: ec=%.0f target=%.0f nutr:%s", ec, target, wantNutr ? "ON" : "OFF");
-                } else {
-                  LOG_WARN("EC control switch failed: ec=%.0f target=%.0f nutr:%s", ec, target, wantNutr ? "ON" : "OFF");
-                }
-              } else if (wantNutr == currNutr && (ec < low || ec > high)) {
-                if (nutrRedriveCount < NUTRI_MOTOR_REDRIVE_MAX && (now - lastNutrRedriveMs >= NUTRI_MOTOR_REDRIVE_INTERVAL_MS)) {
-                  bool ok = driveNutrisiMotorTo(wantNutr);
-                  if (ok) {
-                    lastNutrRelaysOffMs = millis();
-                    lastNutrRedriveMs = millis();
-                    nutrRedriveCount++;
-                  }
-                }
-              }
-            }
-          }
         }
 
         if (lowFlowSeconds >= (int)NO_FLOW_STALL_SECONDS || noProgressSeconds >= (int)NO_PROGRESS_STALL_SECONDS) {
@@ -1818,6 +1868,21 @@ void TaskModbus(void* pv) {
       lastPumpSyncMs = millis();
     }
 
+    if (millis() - lastVfdKeepAliveMs >= VFD_KEEPALIVE_INTERVAL_MS) {
+      lastVfdKeepAliveMs = millis();
+      uint8_t res = 0xFF;
+      for (int attempt = 0; attempt < VFD_CMD_RETRY_COUNT; attempt++) {
+        lockModbus();
+        res = vfdNode.readHoldingRegisters(VFD_REG_RUN_STATUS, 1);
+        unlockModbus();
+        if (res == vfdNode.ku8MBSuccess) break;
+        vTaskDelay(pdMS_TO_TICKS(VFD_CMD_RETRY_DELAY_MS));
+      }
+      if (res != vfdNode.ku8MBSuccess) {
+        LOG_WARN("VFD keepalive timeout code:%u", res);
+      }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(autoMode ? HMI_POLL_INTERVAL_AUTO_MS : HMI_POLL_INTERVAL_MANUAL_MS));
   }
 }
@@ -1925,7 +1990,6 @@ void setup() {
     configs[i].phaseName = preferences.getString((prefix + "phaseName").c_str(), "");
     configs[i].waterRequirement = preferences.getFloat((prefix + "waterReq").c_str(), 0.0);
     configs[i].waterPerSchedule = preferences.getFloat((prefix + "wps").c_str(), 0.0);
-    configs[i].targetEC = preferences.getFloat((prefix + "targetEC").c_str(), 0.0);
     configs[i].irrigationType = preferences.getString((prefix + "irrigType").c_str(), "");
     configs[i].scheduleCount = preferences.getInt((prefix + "schedCount").c_str(), 0);
     if (configs[i].scheduleCount < 0) configs[i].scheduleCount = 0;
@@ -1961,7 +2025,6 @@ void setup() {
         currentIrrigation.irrigationType = configs[i].irrigationType;
         currentIrrigation.waterNeeded = configs[i].waterPerSchedule;
         currentIrrigation.waterDelivered = 0;
-        currentIrrigation.targetEC = configs[i].targetEC;
         currentIrrigation.startMillis = millis();
         currentIrrigation.landRelay = mapLandToValve(configs[i].landName);
         currentIrrigation.configIndex = i;
@@ -1973,11 +2036,10 @@ void setup() {
         vTaskDelay(pdMS_TO_TICKS(irrigationStepDelayMs()));
 
         bool isAirNutrisi = currentIrrigation.irrigationType.equalsIgnoreCase("air_nutrisi") || currentIrrigation.irrigationType.equalsIgnoreCase("air+nutrisi");
-        bool ecControlEnabled = isAirNutrisi && currentIrrigation.targetEC > 0.1f;
         int landIdx = currentIrrigation.landRelay - 1;
         bool desired[VALVE_COUNT] = {false, false, false, false, false};
         desired[WATER_SUPPLY_VALVE_IDX] = true;
-        if (isAirNutrisi && !ecControlEnabled) desired[NUTRI_SUPPLY_VALVE_IDX] = true;
+        if (isAirNutrisi) desired[NUTRI_SUPPLY_VALVE_IDX] = true;
         if (landIdx >= 0 && landIdx < VALVE_COUNT) desired[landIdx] = true;
 
         bool allOk = applyRelayStateSafeBatch(desired);
