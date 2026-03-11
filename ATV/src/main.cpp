@@ -13,18 +13,28 @@ static constexpr uint16_t REG_ETA  = 0x31C5;  // ETA (status word)
 static constexpr uint16_t REG_RFRD = 0x31C6;  // RFRD (actual speed)
 
 static constexpr uint16_t CMD_DISABLE_VOLTAGE      = 0x0000;
+static constexpr uint16_t CMD_SHUTDOWN             = 0x0006;
 static constexpr uint16_t CMD_SWITCH_ON            = 0x0007;
 static constexpr uint16_t CMD_ENABLE_OPERATION_FWD = 0x000F;
 static constexpr uint16_t CMD_ENABLE_OPERATION_REV = 0x080F;
 static constexpr uint16_t CMD_QUICK_STOP           = 0x0002;
 static constexpr uint16_t CMD_FAULT_RESET          = 0x0080;
+static constexpr uint8_t RELAY_ID = 6;
+static constexpr uint16_t PUMP_RELAY_COIL = 10;
+static constexpr int RELAY_WRITE_RETRY_COUNT = 3;
+static constexpr int RELAY_WRITE_RETRY_DELAY_MS = 50;
 
 static HardwareSerial& RS485_SERIAL = Serial2;
 static ModbusMaster node;
+static ModbusMaster relayNode;
 
-static uint8_t  vfdAddress    = 1;
+static uint8_t  vfdAddress    = 7;
 static uint32_t rs485Baud     = 9600;
+static uint32_t rs485Config   = SERIAL_8N1;
 static float    maxFrequencyHz = MAX_ALLOWED_HZ;
+static float    frequencyScale = 3.0f;
+static uint32_t lastKeepAliveMs = 0;
+static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 10000;
 
 enum class InputMode : uint8_t {
   Menu,
@@ -32,6 +42,7 @@ enum class InputMode : uint8_t {
   SetAddr,
   SetBaud,
   SetMaxHz,
+  SetScale,
   ScanStart,
   ScanEnd
 };
@@ -73,10 +84,13 @@ static void initModbus() {
     pinMode(RS485_DE_RE_PIN, OUTPUT);
     digitalWrite(RS485_DE_RE_PIN, LOW);
   }
-  RS485_SERIAL.begin(rs485Baud, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  RS485_SERIAL.begin(rs485Baud, rs485Config, RS485_RX_PIN, RS485_TX_PIN);
   node.begin(vfdAddress, RS485_SERIAL);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
+  relayNode.begin(RELAY_ID, RS485_SERIAL);
+  relayNode.preTransmission(preTransmission);
+  relayNode.postTransmission(postTransmission);
 }
 
 static bool probeAddress(uint8_t address) {
@@ -94,6 +108,8 @@ static void printMenu() {
                 vfdAddress,
                 (unsigned long)rs485Baud,
                 maxFrequencyHz);
+  Serial.printf("FreqScale: %.2f\n", frequencyScale);
+  Serial.print("Serial: 8N1\n");
   if (RS485_DE_RE_PIN >= 0) {
     Serial.printf("DE/RE pin: %d\n", RS485_DE_RE_PIN);
   } else {
@@ -110,6 +126,7 @@ static void printMenu() {
   Serial.println("8. Set RS485 Baudrate");
   Serial.println("9. Set Max Frequency (Hz)");
   Serial.println("10. Scan/Ping inverter");
+  Serial.println("11. Set Frequency Scale");
   Serial.println("0. Tampilkan menu");
   Serial.println();
   Serial.print("Pilih menu: ");
@@ -124,6 +141,52 @@ static bool writeRegister(uint16_t reg, uint16_t value) {
                 result,
                 modbusErrorToString(result));
   return false;
+}
+
+static bool writeRelayCoilWithRetry(uint16_t coil, bool state) {
+  uint8_t lastErr = 0xFF;
+  for (int attempt = 0; attempt < RELAY_WRITE_RETRY_COUNT; attempt++) {
+    uint8_t result = relayNode.writeSingleCoil(coil, state ? 1 : 0);
+    if (result == relayNode.ku8MBSuccess) return true;
+    lastErr = result;
+    delay(RELAY_WRITE_RETRY_DELAY_MS);
+  }
+  Serial.printf("Relay write gagal coil=%u state=%u err=0x%02X (%s)\n",
+                coil,
+                state ? 1 : 0,
+                lastErr,
+                modbusErrorToString(lastErr));
+  return false;
+}
+
+static bool readRelayCoilState(uint16_t coil, bool& state) {
+  uint8_t result = relayNode.readCoils(coil, 1);
+  if (result != relayNode.ku8MBSuccess) {
+    Serial.printf("Relay read gagal coil=%u err=0x%02X (%s)\n",
+                  coil,
+                  result,
+                  modbusErrorToString(result));
+    return false;
+  }
+  uint16_t word = relayNode.getResponseBuffer(0);
+  state = (word & 0x01) != 0;
+  return true;
+}
+
+static bool controlPumpRelay(bool on) {
+  bool ok = writeRelayCoilWithRetry(PUMP_RELAY_COIL, on);
+  bool actual = on;
+  if (ok) {
+    bool readOk = readRelayCoilState(PUMP_RELAY_COIL, actual);
+    if (readOk && actual != on) {
+      Serial.printf("Relay verify mismatch coil=%u want=%u got=%u\n",
+                    PUMP_RELAY_COIL,
+                    on ? 1 : 0,
+                    actual ? 1 : 0);
+    }
+  }
+  Serial.printf("Pump relay %s\n", on ? "ON" : "OFF");
+  return ok;
 }
 
 static bool readRegisters(uint16_t startReg, uint16_t count) {
@@ -143,16 +206,26 @@ static void sendCmd(uint16_t cmd) {
   }
 }
 
+static void sendRunSequence(uint16_t runCmd) {
+  if (!writeRegister(REG_CMD, CMD_SHUTDOWN)) return;
+  delay(50);
+  if (!writeRegister(REG_CMD, CMD_SWITCH_ON)) return;
+  delay(50);
+  if (writeRegister(REG_CMD, runCmd)) {
+    Serial.printf("OK CMD=0x%04X\n", runCmd);
+  }
+}
+
 static void cmdRunForward() {
-  sendCmd(CMD_ENABLE_OPERATION_FWD);
+  controlPumpRelay(true);
 }
 
 static void cmdRunReverse() {
-  sendCmd(CMD_ENABLE_OPERATION_REV);
+  controlPumpRelay(true);
 }
 
 static void cmdStop() {
-  sendCmd(CMD_DISABLE_VOLTAGE);
+  controlPumpRelay(false);
 }
 
 static void cmdQuickStop() {
@@ -166,12 +239,16 @@ static void cmdFaultReset() {
 static void cmdSetFrequencyHz(float hz) {
   float safeHz = hz;
   if (safeHz < 0.0f) safeHz = 0.0f;
-  if (safeHz > MAX_ALLOWED_HZ) safeHz = MAX_ALLOWED_HZ;
+  float maxInputHz = MAX_ALLOWED_HZ;
+  if (frequencyScale < 0.01f) frequencyScale = 0.01f;
+  float maxByScale = 4000.0f / (10.0f * frequencyScale);
+  if (maxByScale < maxInputHz) maxInputHz = maxByScale;
+  if (safeHz > maxInputHz) safeHz = maxInputHz;
   if (maxFrequencyHz < 0.01f) maxFrequencyHz = 0.01f;
   if (maxFrequencyHz > MAX_ALLOWED_HZ) maxFrequencyHz = MAX_ALLOWED_HZ;
   if (safeHz > maxFrequencyHz) safeHz = maxFrequencyHz;
 
-  int32_t raw = (int32_t)lroundf(safeHz * 10.0f);
+  int32_t raw = (int32_t)lroundf(safeHz * frequencyScale * 10.0f);
   if (raw < 0) raw = 0;
   if (raw > 4000) raw = 4000;
 
@@ -217,6 +294,19 @@ static void handleLine(const String& line) {
     } else {
       maxFrequencyHz = hz;
       Serial.printf("OK MaxHz=%.2f\n", maxFrequencyHz);
+    }
+    inputMode = InputMode::Menu;
+    printMenu();
+    return;
+  }
+
+  if (inputMode == InputMode::SetScale) {
+    float scale = s.toFloat();
+    if (scale < 0.1f || scale > 10.0f) {
+      Serial.println("Scale tidak valid. Range: 0.1..10.0");
+    } else {
+      frequencyScale = scale;
+      Serial.printf("OK FreqScale=%.2f\n", frequencyScale);
     }
     inputMode = InputMode::Menu;
     printMenu();
@@ -386,6 +476,12 @@ static void handleLine(const String& line) {
     Serial.print("Start addr: ");
     return;
   }
+  if (s == "11") {
+    inputMode = InputMode::SetScale;
+    Serial.println("Masukkan freq scale (contoh: 1.0 / 3.0).");
+    Serial.print("Scale: ");
+    return;
+  }
   if (s == "0") {
     printMenu();
     return;
@@ -406,6 +502,14 @@ void setup() {
 }
 
 void loop() {
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastKeepAliveMs) >= KEEPALIVE_INTERVAL_MS) {
+    lastKeepAliveMs = now;
+    uint8_t result = node.readHoldingRegisters(REG_ETA, 1);
+    if (result != node.ku8MBSuccess) {
+      initModbus();
+    }
+  }
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n');
     handleLine(line);
